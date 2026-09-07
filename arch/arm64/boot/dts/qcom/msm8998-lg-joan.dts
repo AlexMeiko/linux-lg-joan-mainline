@@ -145,6 +145,61 @@
 	status = "okay";
 };
 
+&mdss_dsi0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	vdd-supply = <&vreg_l1a_0p875>;
+	vdda-supply = <&vreg_l2a_1p2>;
+
+	panel@0 {
+		compatible = "lg,sw43402";
+		reg = <0>;
+
+		reset-gpios = <&tlmm 35 GPIO_ACTIVE_HIGH>;
+		vddio-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
+		vpnl-gpios = <&tlmm 69 GPIO_ACTIVE_HIGH>;
+		disp-te-gpios = <&tlmm 10 GPIO_ACTIVE_HIGH>;
+
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&panel_active &panel_te_active>;
+		pinctrl-1 = <&panel_suspend &panel_te_suspend>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	vdds-supply = <&vreg_l1a_0p875>;
+	status = "okay";
+};
+
+&mdss {
+	status = "okay";
+};
+
+&mdss_mdp {
+	status = "okay";
+};
+
+&mmcc {
+	status = "okay";
+};
+
+&mmss_smmu {
+	status = "okay";
+};
+
 &pm8998_gpios {
 	volume_up_default: volume-up-state {
 		pins = "gpio6";
@@ -158,6 +213,18 @@
 &pm8998_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
 	status = "okay";
+};
+
+&pm8005_regulators {
+	vdd_s1-supply = <&vph_pwr>;
+
+	pm8005_s1: s1 {
+		/* VDD_GFX is required before the GPU GX power domain can enable. */
+		regulator-min-microvolt = <524000>;
+		regulator-max-microvolt = <1100000>;
+		regulator-enable-ramp-delay = <500>;
+		regulator-always-on;
+	};
 };
 
 &qusb2phy {
@@ -277,6 +344,34 @@
 
 &tlmm {
 	gpio-reserved-ranges = <0 4>, <49 4>, <81 4>;
+
+	panel_active: panel-active-state {
+		pins = "gpio35", "gpio69", "gpio92";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	panel_suspend: panel-suspend-state {
+		pins = "gpio35", "gpio69", "gpio92";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	panel_te_active: panel-te-active-state {
+		pins = "gpio10";
+		function = "mdp_vsync_a";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	panel_te_suspend: panel-te-suspend-state {
+		pins = "gpio10";
+		function = "mdp_vsync_a";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
 
 	uart_console_active: uart-console-active-state {
 		pins = "gpio4", "gpio5";
