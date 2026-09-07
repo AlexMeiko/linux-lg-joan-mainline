@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * LG V30 (joan) device tree
+ *
+ * Copyright (c) 2026 GuWolf <admin@guwolf.com>
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+#include "msm8998.dtsi"
+#include "pm8005.dtsi"
+#include "pm8998.dtsi"
+#include "pmi8998.dtsi"
+
+/* The firmware carveouts differ from the MSM8998 reference layout. */
+/delete-node/ &rmtfs_mem;
+/delete-node/ &adsp_mem;
+/delete-node/ &mpss_mem;
+/delete-node/ &venus_mem;
+/delete-node/ &mba_mem;
+/delete-node/ &slpi_mem;
+/delete-node/ &ipa_fw_mem;
+/delete-node/ &ipa_gsi_mem;
+/delete-node/ &gpu_mem;
+/delete-node/ &wlan_msa_mem;
+/delete-node/ &wifi;
+
+/ {
+	model = "LG V30";
+	compatible = "lg,joan", "qcom,msm8998";
+	chassis-type = "handset";
+
+	/* Required for LG's bootloader to select this DTB on rev 1.0 hardware. */
+	qcom,msm-id = <292 0x20001>;
+	qcom,board-id = <0xc08 0>;
+
+	aliases {
+		serial0 = &blsp2_uart1;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		label = "Volume buttons";
+		autorepeat;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&volume_up_default>;
+
+		button-volume-up {
+			label = "Volume up";
+			gpios = <&pm8998_gpios 6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <15>;
+			wakeup-source;
+		};
+	};
+
+	reserved-memory {
+		/* The downstream secure carveout also reserves this 1 MiB gap. */
+		memory@85f00000 {
+			reg = <0x0 0x85f00000 0x0 0x100000>;
+			no-map;
+		};
+
+		/* Keep the bootloader-owned splash framebuffer out of normal RAM. */
+		memory@9d400000 {
+			reg = <0x0 0x9d400000 0x0 0x2400000>;
+			no-map;
+		};
+
+		/* Match the ramoops region used by the LG recovery kernel. */
+		ramoops@b0000000 {
+			compatible = "ramoops";
+			reg = <0x0 0xb0000000 0x0 0x80000>;
+			record-size = <0x40000>;
+			console-size = <0x40000>;
+			max-reason = <5>;
+		};
+
+		/* The remaining half of LG's persistent log region is vendor-owned. */
+		memory@b0080000 {
+			reg = <0x0 0xb0080000 0x0 0x80000>;
+			no-map;
+		};
+
+		/* LG firmware may use this framebuffer while handling a crash. */
+		memory@b0100000 {
+			reg = <0x0 0xb0100000 0x0 0x1800000>;
+			no-map;
+		};
+
+		adsp_mem: memory@92b00000 {
+			reg = <0x0 0x92b00000 0x0 0x1e00000>;
+			no-map;
+		};
+
+		mpss_mem: memory@8b400000 {
+			reg = <0x0 0x8b400000 0x0 0x7700000>;
+			no-map;
+		};
+
+		venus_mem: memory@94900000 {
+			reg = <0x0 0x94900000 0x0 0x500000>;
+			no-map;
+		};
+
+		mba_mem: memory@94e00000 {
+			reg = <0x0 0x94e00000 0x0 0x200000>;
+			no-map;
+		};
+
+		slpi_mem: memory@95000000 {
+			reg = <0x0 0x95000000 0x0 0xf00000>;
+			no-map;
+		};
+
+		memory@95f00000 {
+			reg = <0x0 0x95f00000 0x0 0x100000>;
+			no-map;
+		};
+	};
+
+	vph_pwr: vph-pwr-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vph_pwr";
+		regulator-always-on;
+		regulator-boot-on;
+	};
+};
+
+&soc {
+	watchdog@17817000 {
+		compatible = "qcom,apss-wdt-msm8998", "qcom,kpss-wdt";
+		reg = <0x17817000 0x1000>;
+		clocks = <&sleep_clk>;
+	};
+};
+
+&blsp2_uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart_console_active>;
+	status = "okay";
+};
+
+&pm8998_gpios {
+	volume_up_default: volume-up-state {
+		pins = "gpio6";
+		function = "normal";
+		bias-pull-up;
+		input-enable;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_NO>;
+	};
+};
+
+&pm8998_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+	status = "okay";
+};
+
+&qusb2phy {
+	vdd-supply = <&vreg_l1a_0p875>;
+	vdda-pll-supply = <&vreg_l12a_1p8>;
+	vdda-phy-dpdm-supply = <&vreg_l24a_3p075>;
+	status = "okay";
+};
+
+&rpm_requests {
+	regulators-0 {
+		compatible = "qcom,rpm-pm8998-regulators";
+
+		vdd_s3-supply = <&vph_pwr>;
+		vdd_s4-supply = <&vph_pwr>;
+		vdd_s5-supply = <&vph_pwr>;
+		vdd_s7-supply = <&vph_pwr>;
+		vdd_l1_l27-supply = <&vreg_s7a_1p025>;
+		vdd_l2_l8_l17-supply = <&vreg_s3a_1p35>;
+		vdd_l7_l12_l14_l15-supply = <&vreg_s5a_2p04>;
+		vdd_l20_l24-supply = <&vreg_bob>;
+		vdd_l26-supply = <&vreg_s3a_1p35>;
+		vdd_lvs1_lvs2-supply = <&vreg_s4a_1p8>;
+
+		vreg_s3a_1p35: s3 {
+			regulator-min-microvolt = <1352000>;
+			regulator-max-microvolt = <1352000>;
+		};
+
+		vreg_s4a_1p8: s4 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_s5a_2p04: s5 {
+			regulator-min-microvolt = <1904000>;
+			regulator-max-microvolt = <2040000>;
+		};
+
+		vreg_s7a_1p025: s7 {
+			regulator-min-microvolt = <900000>;
+			regulator-max-microvolt = <1028000>;
+		};
+
+		vreg_l1a_0p875: l1 {
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <880000>;
+		};
+
+		vreg_l2a_1p2: l2 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+		};
+
+		vreg_l12a_1p8: l12 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
+		vreg_l20a_2p95: l20 {
+			regulator-min-microvolt = <2960000>;
+			regulator-max-microvolt = <2960000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_l24a_3p075: l24 {
+			regulator-min-microvolt = <3088000>;
+			regulator-max-microvolt = <3088000>;
+		};
+
+		vreg_l26a_1p2: l26 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_lvs2a_1p8: lvs2 { };
+	};
+
+	regulators-1 {
+		compatible = "qcom,rpm-pmi8998-regulators";
+		vdd_bob-supply = <&vph_pwr>;
+
+		vreg_bob: bob {
+			regulator-min-microvolt = <3312000>;
+			regulator-max-microvolt = <3600000>;
+		};
+	};
+};
+
+&spss_mem {
+	reg = <0x0 0x8ab00000 0x0 0x600000>;
+};
+
+&tlmm {
+	gpio-reserved-ranges = <0 4>, <49 4>, <81 4>;
+
+	uart_console_active: uart-console-active-state {
+		pins = "gpio4", "gpio5";
+		function = "blsp_uart8_a";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&ufshc {
+	vcc-supply = <&vreg_l20a_2p95>;
+	vccq-supply = <&vreg_l26a_1p2>;
+	vccq2-supply = <&vreg_s4a_1p8>;
+	vdd-hba-supply = <&vreg_l26a_1p2>;
+	vcc-max-microamp = <750000>;
+	vccq-max-microamp = <560000>;
+	vccq2-max-microamp = <750000>;
+	status = "okay";
+};
+
+&ufsphy {
+	vdda-phy-supply = <&vreg_l1a_0p875>;
+	vdda-pll-supply = <&vreg_l2a_1p2>;
+	status = "okay";
+};
+
+&usb3 {
+	qcom,select-utmi-as-pipe-clk;
+	status = "okay";
+};
+
+&usb3_dwc3 {
+	phys = <&qusb2phy>;
+	phy-names = "usb2-phy";
+	maximum-speed = "high-speed";
+	dr_mode = "peripheral";
+};

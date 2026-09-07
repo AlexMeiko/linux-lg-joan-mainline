@@ -31,6 +31,11 @@ properties:
     maxItems: 150
 
 patternProperties:
+  "-hog(-[0-9]+)?$":
+    type: object
+    required:
+      - gpio-hog
+
   "-state$":
     oneOf:
       - $ref: "#/$defs/qcom-msm8998-tlmm-state"
