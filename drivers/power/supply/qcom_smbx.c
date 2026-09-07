@@ -402,6 +402,7 @@ struct smb_chip {
 static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_MODEL_NAME,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
@@ -517,6 +518,51 @@ static int smb_get_prop_status(struct smb_chip *chip, int *val)
 		*val = POWER_SUPPLY_STATUS_UNKNOWN;
 		return rc;
 	}
+}
+
+static int smb_get_prop_charge_behaviour(struct smb_chip *chip, int *val)
+{
+	unsigned int stat;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+			 &stat);
+	if (rc < 0) {
+		dev_err(chip->dev, "Couldn't read charging enable cmd: %d\n",
+			rc);
+		return rc;
+	}
+
+	*val = (stat & CHARGING_ENABLE_CMD_BIT) ?
+		POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
+		POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+	return 0;
+}
+
+static int smb_set_prop_charge_behaviour(struct smb_chip *chip, int val)
+{
+	int rc;
+
+	switch (val) {
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + CHARGING_ENABLE_CMD,
+					CHARGING_ENABLE_CMD_BIT,
+					CHARGING_ENABLE_CMD_BIT);
+		break;
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + CHARGING_ENABLE_CMD,
+					CHARGING_ENABLE_CMD_BIT, 0);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (!rc)
+		power_supply_changed(chip->chg_psy);
+
+	return rc;
 }
 
 static inline int smb_get_current_limit(struct smb_chip *chip,
@@ -664,6 +710,8 @@ static int smb_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_MODEL_NAME:
 		val->strval = chip->name;
 		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_get_prop_charge_behaviour(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_get_current_limit(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
@@ -693,6 +741,8 @@ static int smb_set_property(struct power_supply *psy,
 	struct smb_chip *chip = power_supply_get_drvdata(psy);
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_set_prop_charge_behaviour(chip, val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_set_current_limit(chip, val->intval);
 	default:
@@ -705,6 +755,7 @@ static int smb_property_is_writable(struct power_supply *psy,
 				     enum power_supply_property psp)
 {
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return 1;
 	default:
@@ -768,6 +819,8 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 static const struct power_supply_desc smb_psy_desc = {
 	.name = "pmi8998_charger",
 	.type = POWER_SUPPLY_TYPE_USB,
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |

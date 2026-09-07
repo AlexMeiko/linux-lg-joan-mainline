@@ -129,6 +129,17 @@
 		regulator-always-on;
 		regulator-boot-on;
 	};
+
+	power {
+		battery: battery {
+			compatible = "simple-battery";
+			device-chemistry = "lithium-ion-polymer";
+			charge-full-design-microamp-hours = <3300000>;
+			voltage-min-design-microvolt = <3200000>;
+			voltage-max-design-microvolt = <4400000>;
+			constant-charge-voltage-max-microvolt = <4400000>;
+		};
+	};
 };
 
 &soc {
@@ -216,6 +227,17 @@
 &pm8998_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
 	status = "okay";
+};
+
+&pmi8998_charger {
+	status = "okay";
+	monitored-battery = <&battery>;
+};
+
+&pmi8998_fg {
+	status = "okay";
+	monitored-battery = <&battery>;
+	power-supplies = <&pmi8998_charger>;
 };
 
 &pm8005_regulators {
