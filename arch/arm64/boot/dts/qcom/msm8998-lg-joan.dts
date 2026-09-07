@@ -23,7 +23,6 @@
 /delete-node/ &ipa_gsi_mem;
 /delete-node/ &gpu_mem;
 /delete-node/ &wlan_msa_mem;
-/delete-node/ &wifi;
 
 / {
 	model = "LG V30";
@@ -118,7 +117,7 @@
 			no-map;
 		};
 
-		memory@95f00000 {
+		wlan_msa_mem: memory@95f00000 {
 			reg = <0x0 0x95f00000 0x0 0x100000>;
 			no-map;
 		};
@@ -178,7 +177,9 @@
 		vdd_s7-supply = <&vph_pwr>;
 		vdd_l1_l27-supply = <&vreg_s7a_1p025>;
 		vdd_l2_l8_l17-supply = <&vreg_s3a_1p35>;
+		vdd_l4_l5-supply = <&vreg_s7a_1p025>;
 		vdd_l7_l12_l14_l15-supply = <&vreg_s5a_2p04>;
+		vdd_l10_l23_l25-supply = <&vreg_bob>;
 		vdd_l20_l24-supply = <&vreg_bob>;
 		vdd_l26-supply = <&vreg_s3a_1p35>;
 		vdd_lvs1_lvs2-supply = <&vreg_s4a_1p8>;
@@ -214,9 +215,24 @@
 			regulator-max-microvolt = <1200000>;
 		};
 
+		vreg_l5a_0p8: l5 {
+			regulator-min-microvolt = <800000>;
+			regulator-max-microvolt = <800000>;
+		};
+
+		vreg_l7a_1p8: l7 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
 		vreg_l12a_1p8: l12 {
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
+		};
+
+		vreg_l17a_1p3: l17 {
+			regulator-min-microvolt = <1304000>;
+			regulator-max-microvolt = <1304000>;
 		};
 
 		vreg_l20a_2p95: l20 {
@@ -228,6 +244,11 @@
 		vreg_l24a_3p075: l24 {
 			regulator-min-microvolt = <3088000>;
 			regulator-max-microvolt = <3088000>;
+		};
+
+		vreg_l25a_3p3: l25 {
+			regulator-min-microvolt = <3104000>;
+			regulator-max-microvolt = <3312000>;
 		};
 
 		vreg_l26a_1p2: l26 {
@@ -302,6 +323,9 @@
 
 &wifi {
 	status = "okay";
+	ieee80211-freq-limit = <2402000 2494000>,
+				   <5170000 5835000>;
+
 	vdd-0.8-cx-mx-supply = <&vreg_l5a_0p8>;
 	vdd-1.8-xo-supply = <&vreg_l7a_1p8>;
 	vdd-1.3-rfa-supply = <&vreg_l17a_1p3>;

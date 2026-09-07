@@ -3340,6 +3340,17 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 			ath10k_htt_rx_h_enqueue(ar, &amsdu, status);
 			break;
 		case -EAGAIN:
+			if (QCA_REV_WCN3990(ar)) {
+				ath10k_warn(ar,
+					    "dropping %u msdus from incomplete in-order rx indication\n",
+					    skb_queue_len(&list));
+				/* The buffers were removed from the paddr hash and
+				 * unmapped before A-MSDU extraction. Drop this
+				 * indication and let NAPI replenish the RX ring.
+				 */
+				__skb_queue_purge(&list);
+				return 0;
+			}
 			fallthrough;
 		default:
 			/* Should not happen. */
