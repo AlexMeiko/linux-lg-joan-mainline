@@ -148,7 +148,8 @@
 &mdss_dsi0 {
 	#address-cells = <1>;
 	#size-cells = <0>;
-	status = "okay";
+	/* Temporary bring-up diagnostic: keep the complete display chain offline. */
+	status = "disabled";
 
 	vdd-supply = <&vreg_l1a_0p875>;
 	vdda-supply = <&vreg_l2a_1p2>;
@@ -181,15 +182,17 @@
 
 &mdss_dsi0_phy {
 	vdds-supply = <&vreg_l1a_0p875>;
-	status = "okay";
+	status = "disabled";
 };
 
 &mdss {
-	status = "okay";
+	/* Temporary bring-up diagnostic: keep the complete display chain offline. */
+	/delete-property/ iommus;
+	status = "disabled";
 };
 
 &mdss_mdp {
-	status = "okay";
+	status = "disabled";
 };
 
 &mmcc {
@@ -344,6 +347,28 @@
 
 &tlmm {
 	gpio-reserved-ranges = <0 4>, <49 4>, <81 4>;
+
+	/* Keep the bootloader-initialized OLED physically off in headless mode. */
+	panel-reset-hog {
+		gpio-hog;
+		gpios = <35 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "panel-reset";
+	};
+
+	panel-vddio-hog {
+		gpio-hog;
+		gpios = <92 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "panel-vddio";
+	};
+
+	panel-vpnl-hog {
+		gpio-hog;
+		gpios = <69 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "panel-vpnl";
+	};
 
 	panel_active: panel-active-state {
 		pins = "gpio35", "gpio69", "gpio92";
