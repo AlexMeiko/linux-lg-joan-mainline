@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cpufreq/lg,joan-osm-cpufreq.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: LG V30 MSM8998 OSM CPU frequency controller
+
+maintainers:
+  - GuWolf <admin@guwolf.com>
+
+description: |
+  The MSM8998 OSM v2 blocks on the LG V30 are not initialized by the boot
+  firmware. The operating points and open-loop voltages are derived from
+  per-device QFPROM data before the two CPRH and OSM domains are enabled.
+
+properties:
+  compatible:
+    const: lg,joan-osm-cpufreq
+
+  reg:
+    minItems: 6
+    maxItems: 6
+
+  reg-names:
+    items:
+      - const: osm
+      - const: power-cprh
+      - const: performance-cprh
+      - const: power-acd
+      - const: performance-acd
+      - const: apcs-common
+
+  clocks:
+    minItems: 3
+    maxItems: 3
+
+  clock-names:
+    items:
+      - const: cpr
+      - const: aux
+      - const: xo
+
+  nvmem-cells:
+    minItems: 8
+    maxItems: 8
+
+  nvmem-cell-names:
+    items:
+      - const: row38
+      - const: row39
+      - const: row67
+      - const: row68
+      - const: row69
+      - const: row70
+      - const: row71
+      - const: row100
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - nvmem-cells
+  - nvmem-cell-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/qcom,gcc-msm8998.h>
+    #include <dt-bindings/clock/qcom,rpmcc.h>
+
+    cpufreq@179c0000 {
+        compatible = "lg,joan-osm-cpufreq";
+        reg = <0x179c0000 0x4000>,
+              <0x179c8000 0x4000>,
+              <0x179c4000 0x4000>,
+              <0x17914800 0x800>,
+              <0x17814800 0x800>,
+              <0x179d1000 0x1000>;
+        reg-names = "osm", "power-cprh", "performance-cprh",
+                    "power-acd", "performance-acd", "apcs-common";
+
+        clocks = <&gcc GCC_HMSS_RBCPR_CLK>,
+                 <&gcc HMSS_GPLL0_CLK_SRC>,
+                 <&rpmcc RPM_SMD_XO_CLK_SRC>;
+        clock-names = "cpr", "aux", "xo";
+
+        nvmem-cells = <&cpr_fuse_row38>, <&cpr_fuse_row39>,
+                      <&cpr_fuse_row67>, <&cpr_fuse_row68>,
+                      <&cpr_fuse_row69>, <&cpr_fuse_row70>,
+                      <&cpr_fuse_row71>, <&cpr_fuse_row100>;
+        nvmem-cell-names = "row38", "row39", "row67", "row68",
+                           "row69", "row70", "row71", "row100";
+    };

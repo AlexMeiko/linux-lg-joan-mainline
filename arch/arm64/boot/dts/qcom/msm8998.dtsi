@@ -853,6 +853,36 @@
 			#address-cells = <1>;
 			#size-cells = <1>;
 
+			/*
+			 * CPRH fields use fuse rows numbered in 64-bit words. Keep the
+			 * complete rows because several fields cross rows or concatenate
+			 * non-contiguous segments. The consumer performs the bit parsing.
+			 */
+			cpr_fuse_row38: cpr-fuse-row38@130 {
+				reg = <0x130 0x8>;
+			};
+			cpr_fuse_row39: cpr-fuse-row39@138 {
+				reg = <0x138 0x8>;
+			};
+			cpr_fuse_row67: cpr-fuse-row67@218 {
+				reg = <0x218 0x8>;
+			};
+			cpr_fuse_row68: cpr-fuse-row68@220 {
+				reg = <0x220 0x8>;
+			};
+			cpr_fuse_row69: cpr-fuse-row69@228 {
+				reg = <0x228 0x8>;
+			};
+			cpr_fuse_row70: cpr-fuse-row70@230 {
+				reg = <0x230 0x8>;
+			};
+			cpr_fuse_row71: cpr-fuse-row71@238 {
+				reg = <0x238 0x8>;
+			};
+			cpr_fuse_row100: cpr-fuse-row100@320 {
+				reg = <0x320 0x8>;
+			};
+
 			qusb2_hstx_trim: hstx-trim@23a {
 				reg = <0x23a 0x1>;
 				bits = <0 4>;

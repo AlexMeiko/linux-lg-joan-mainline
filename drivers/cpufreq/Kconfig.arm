@@ -169,6 +169,33 @@ config ARM_QCOM_CPUFREQ_HW
 	  The driver implements the cpufreq interface for this HW engine.
 	  Say Y if you want to support CPUFreq HW.
 
+config ARM_QCOM_CPUFREQ_MSM8998_FUSE
+	bool
+
+config ARM_QCOM_CPUFREQ_MSM8998
+	bool "Qualcomm MSM8998 OSM CPU frequency support"
+	depends on ARCH_QCOM
+	depends on NVMEM
+	depends on QCOM_SCM
+	select ARM_QCOM_CPUFREQ_MSM8998_FUSE
+	help
+	  Enable CPU frequency scaling through the OSM v2 and CPRH blocks in
+	  MSM8998. The first supported device is the LG V30 (joan), whose
+	  per-device open-loop voltages are derived from QFPROM before OSM is
+	  enabled.
+
+config ARM_QCOM_CPUFREQ_MSM8998_FUSE_KUNIT_TEST
+	bool "KUnit tests for MSM8998 CPU fuse calculations" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	depends on ARCH_QCOM || COMPILE_TEST
+	select ARM_QCOM_CPUFREQ_MSM8998_FUSE
+	default KUNIT_ALL_TESTS
+	help
+	  Test the side-effect-free MSM8998 CPR fuse decoder and voltage
+	  calculations against known hardware data. The test starts with raw
+	  QFPROM rows so that fields spanning rows and non-contiguous bit
+	  ranges are covered as well.
+
 config ARM_RASPBERRYPI_CPUFREQ
 	tristate "Raspberry Pi cpufreq support"
 	depends on CLK_RASPBERRYPI || COMPILE_TEST

@@ -143,6 +143,33 @@
 };
 
 &soc {
+	cpufreq@179c0000 {
+		compatible = "lg,joan-osm-cpufreq";
+		reg = <0x179c0000 0x4000>,
+		      <0x179c8000 0x4000>,
+		      <0x179c4000 0x4000>,
+		      <0x17914800 0x800>,
+		      <0x17814800 0x800>,
+		      <0x179d1000 0x1000>,
+		      <0x17912000 0x1000>,
+		      <0x17812000 0x1000>;
+		reg-names = "osm", "power-cprh", "performance-cprh",
+			    "power-acd", "performance-acd", "apcs-common",
+			    "power-saw", "performance-saw";
+
+		clocks = <&gcc GCC_HMSS_RBCPR_CLK>,
+			 <&gcc HMSS_GPLL0_CLK_SRC>,
+			 <&rpmcc RPM_SMD_XO_CLK_SRC>;
+		clock-names = "cpr", "aux", "xo";
+
+		nvmem-cells = <&cpr_fuse_row38>, <&cpr_fuse_row39>,
+			      <&cpr_fuse_row67>, <&cpr_fuse_row68>,
+			      <&cpr_fuse_row69>, <&cpr_fuse_row70>,
+			      <&cpr_fuse_row71>, <&cpr_fuse_row100>;
+		nvmem-cell-names = "row38", "row39", "row67", "row68",
+				   "row69", "row70", "row71", "row100";
+	};
+
 	watchdog@17817000 {
 		compatible = "qcom,apss-wdt-msm8998", "qcom,kpss-wdt";
 		reg = <0x17817000 0x1000>;
