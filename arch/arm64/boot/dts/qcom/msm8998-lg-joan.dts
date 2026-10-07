@@ -121,6 +121,22 @@
 			reg = <0x0 0x95f00000 0x0 0x100000>;
 			no-map;
 		};
+
+		/*
+		 * Adreno 540 zap shader staging area.  The A540 on this SoC
+		 * refuses to leave secure mode via SECVID_TRUST_CNTL (the
+		 * "guessed wrong" case in a5xx_gpu.c), so the zap shader must
+		 * be authenticated by the secure world through the PAS (PAS ID
+		 * 13) path.  The H930 a540_zap.mdt segments carry the
+		 * relocatable flag, so any 0x2000-aligned free physical range
+		 * works; 0x96000000 sits directly above the WLAN MSA carveout
+		 * and below the first LG firmware region at 0x9d400000.
+		 */
+		zap_shader_region: memory@96000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x96000000 0x0 0x2000>;
+			no-map;
+		};
 	};
 
 	vph_pwr: vph-pwr-regulator {
@@ -174,6 +190,42 @@
 		compatible = "qcom,apss-wdt-msm8998", "qcom,kpss-wdt";
 		reg = <0x17817000 0x1000>;
 		clocks = <&sleep_clk>;
+	};
+};
+
+/*
+ * Headless GPU-only bring-up: enable the Adreno 540 while the entire display
+ * chain (mdss / mdss_mdp / mdss_dsi0 / mdss_dsi0_phy) stays disabled. The GPU
+ * must therefore not wait for the mdss component master, which is why msm has
+ * to be loaded with separate_gpu_kms=1; see notes/joan-gpu-headless.md. The GPU
+ * then registers its own DRM device with DRIVER_RENDER and exposes
+ * /dev/dri/renderD128 for surfaceless EGL, with no KMS and no /dev/fb*.
+ *
+ * Do NOT enable &venus (video-codec@cc00000) together with this. Enabling Venus
+ * made mainline 6.18.49-r88 hard-reset during boot: udev autoloads venus-core
+ * from the DT modalias, then qcom_scm_pas_auth_and_reset() resets the
+ * TrustZone/PAS path. Venus must stay disabled until that is root-caused.
+ *
+ * VDD_GFX (pm8005_s1) is already marked regulator-always-on above, and
+ * adreno_smmu / gpucc / gcc / rpmpd are all enabled by default in msm8998.dtsi,
+ * so status is the only change the GPU node itself needs.
+ */
+&adreno_gpu {
+	status = "okay";
+
+	/*
+	 * LG's own kernel loads the a540_zap shader for this GPU through PAS
+	 * (qcom,kgsl-hyp, pas-id 13, firmware-name "a540_zap"), so the A540 on
+	 * joan does require the zap shader: the fallback path that writes
+	 * RBBM_SECVID_TRUST_CNTL directly is rejected by the secure world and
+	 * ends in an RCU stall as soon as the render node is opened.
+	 * H930/H932 zap binaries are interchangeable on joan (only H932 has
+	 * its own signing keys); the H930 set is installed as
+	 * /lib/firmware/qcom/a540_zap.mdt plus .b00/.b01/.b02.
+	 */
+	zap-shader {
+		memory-region = <&zap_shader_region>;
+		firmware-name = "qcom/a540_zap.mdt";
 	};
 };
 
