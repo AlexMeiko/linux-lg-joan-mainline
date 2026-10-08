@@ -118,7 +118,29 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
 		goto err_put_rpm;
 	}
 
-	pm_runtime_put_autosuspend(&pdev->dev);
+	/*
+	 * On some platforms the GPU's runtime suspend/resume cycle is not
+	 * lossless.  Powering the GPU down also powers down its SMMU -- the
+	 * arm-smmu driver sets up a runtime-PM device link from the master to
+	 * the SMMU, and the GPU SMMU's power domain has no other consumer --
+	 * and the state the two come back up with is not sufficient for the
+	 * GPU to translate its addresses: the GPU then faults on essentially
+	 * everything it touches.
+	 *
+	 * The driver recovers from that (hangcheck -> msm_gpu_recover()), but
+	 * the recovery path itself can wedge the SoC under concurrent load,
+	 * which shows up as a completely silent hard reset.  Seen on
+	 * msm8998/LG V30 (Adreno 540) with four concurrent headless Chromium
+	 * instances: ~25% of such runs end in a reset, and the failure is
+	 * gone once the GPU is kept runtime-resumed.
+	 *
+	 * Until the suspend/resume path is understood well enough to be
+	 * lossless, let affected platforms opt out of runtime PM for the GPU.
+	 */
+	if (of_property_read_bool(pdev->dev.of_node, "qcom,no-runtime-pm"))
+		pm_runtime_forbid(&pdev->dev);
+	else
+		pm_runtime_put_autosuspend(&pdev->dev);
 
 #ifdef CONFIG_DEBUG_FS
 	if (gpu->funcs->debugfs_init) {
