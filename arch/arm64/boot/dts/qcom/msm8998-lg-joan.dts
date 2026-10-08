@@ -214,6 +214,18 @@
 	status = "okay";
 
 	/*
+	 * Powering the GPU (and, with it, the GPU's SMMU) down and back up
+	 * again is not lossless on joan: the GPU comes back unable to
+	 * translate its addresses, faults on everything it touches, and the
+	 * hangcheck recovery that follows can wedge the SoC -- a completely
+	 * silent hard reset that the bootloader then reports as
+	 * bootreasoncode 0x20.  Reproduces with four concurrent headless
+	 * Chromium instances and disappears as soon as the GPU is kept
+	 * runtime-resumed, so opt this board out of GPU runtime PM.
+	 */
+	qcom,no-runtime-pm;
+
+	/*
 	 * LG's own kernel loads the a540_zap shader for this GPU through PAS
 	 * (qcom,kgsl-hyp, pas-id 13, firmware-name "a540_zap"), so the A540 on
 	 * joan does require the zap shader: the fallback path that writes
@@ -323,9 +335,50 @@
 	vdd_s1-supply = <&vph_pwr>;
 
 	pm8005_s1: s1 {
-		/* VDD_GFX is required before the GPU GX power domain can enable. */
-		regulator-min-microvolt = <524000>;
-		regulator-max-microvolt = <1100000>;
+		/*
+		 * VDD_GFX, required before the GPU GX power domain can enable.
+		 *
+		 * mainline has no GPU CPR and the Adreno driver never calls
+		 * regulator_set_voltage() on this rail: the GPU node has no
+		 * vdd-supply, so msm_gpu binds a dummy regulator ("supply vdd not
+		 * found, using dummy regulator") and only ever enables/disables it.
+		 * With a min/max *range* the regulator core also leaves the rail
+		 * alone, so VDD_GFX stayed at whatever LG's bootloader programmed:
+		 * 752 mV.
+		 *
+		 * 752 mV is far below the vendor value for the top GPU OPP
+		 * (964 mV @ 710 MHz per the msm8998 kgsl OPP table).  With the
+		 * GPU kept runtime-resumed (see the adreno_gpu node above) the
+		 * rail no longer resets the device, but 752 mV is a pinched
+		 * setpoint: sustained 4x chromium 1080p load produces sporadic
+		 * SMMU context faults.
+		 *
+		 * Pinning min == max makes machine_constraints_voltage() push
+		 * the rail to that setpoint at probe time -- the intended
+		 * "hack until we rig up the gpu consumer" that pm8005_s1's
+		 * always-on comment refers to.
+		 *
+		 * 2026-10-08 full 4 mV-step sweep (GPU pinned at 710 MHz,
+		 * 4x chromium 1080p capture per round, kernel with the GPU
+		 * kept resumed via qcom,no-runtime-pm):
+		 *   752 mV: SMMU faults, sporadic
+		 *   776 mV: SMMU faults from round 1
+		 *   792 mV: SMMU faults, first burst at round 14
+		 *   796 mV: SMMU faults at rounds 7 and 13
+		 *   800 mV: SMMU faults at rounds 8 and 10
+		 *   804 mV: clean over 15 rounds -- lowest fault-free setpoint
+		 *   856 mV: clean over 15 + 30 rounds -- released setpoint
+		 *   964 mV: clean, the vendor value
+		 *
+		 * The clean/unhealthy edge is a single 4 mV step (800 -> 804),
+		 * so the released setpoint keeps 52 mV of margin above the
+		 * measured floor while sitting 108 mV below the vendor value.
+		 * Faults are bursty and can hide for ~14 rounds: re-run the
+		 * 30-round sweep before lowering this setpoint, and fall back
+		 * to 964000 if 856000 ever misbehaves.
+		 */
+		regulator-min-microvolt = <856000>;
+		regulator-max-microvolt = <856000>;
 		regulator-enable-ramp-delay = <500>;
 		regulator-always-on;
 	};
