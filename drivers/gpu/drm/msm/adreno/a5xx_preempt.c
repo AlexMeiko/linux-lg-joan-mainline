@@ -223,6 +223,22 @@ void a5xx_preempt_hw_init(struct msm_gpu *gpu)
 	/* Always come up on rb 0 */
 	a5xx_gpu->cur_ring = gpu->rb[0];
 
+	/*
+	 * The GPU forgets which context it was running when it is powered
+	 * down (runtime suspend, or the suspend/resume pair issued by
+	 * adreno_recover()), but we still remember the last context that
+	 * submitted to each ring.  A stale value makes the next submit from
+	 * that context skip its context-restore buffer -- the buffer that
+	 * reprograms the GPU's SMMU pagetable -- so the GPU ends up running
+	 * with whatever pagetable state it came back up with and faults on
+	 * every address it touches.  Forget the current context so the next
+	 * submit performs a full restore.
+	 */
+	for (i = 0; i < gpu->nr_rings; i++) {
+		if (gpu->rb[i])
+			gpu->rb[i]->cur_ctx_seqno = 0;
+	}
+
 	/* No preemption if we only have one ring */
 	if (gpu->nr_rings == 1)
 		return;
