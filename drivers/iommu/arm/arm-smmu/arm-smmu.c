@@ -1655,13 +1655,93 @@ static const struct iommu_ops arm_smmu_ops = {
 	}
 };
 
+/* Software shadows only; firmware-owned hardware state is not read here. */
+static void joan_mmss_smmu_trace(struct arm_smmu_device *smmu,
+				 const char *event, int ret, bool shadow)
+{
+	static const u16 fw_sids[] = { 0x580, 0x586 };
+	unsigned int n;
+
+	if (smmu->ioaddr != 0xcd00000 ||
+	    !of_device_is_compatible(smmu->dev->of_node, "qcom,msm8998-smmu-v2"))
+		return;
+
+	dev_info(smmu->dev, "joan-smmu-trace: %s ret=%d disable_bypass=%u\n",
+		 event, ret, disable_bypass);
+	if (!shadow)
+		return;
+
+	for (n = 0; n < ARRAY_SIZE(fw_sids); n++) {
+		unsigned int i, matches = 0;
+		u16 sid = fw_sids[n], first_id = 0, first_mask = 0;
+		int first = -1, type = -1, cbndx = -1, count = -1;
+
+		/* READ_ONCE does not make these separate fields one snapshot. */
+		for (i = 0; smmu->smrs && i < smmu->num_mapping_groups; i++) {
+			struct arm_smmu_smr *smr = &smmu->smrs[i];
+			u16 id, mask;
+
+			if (!READ_ONCE(smr->valid))
+				continue;
+			id = READ_ONCE(smr->id);
+			mask = READ_ONCE(smr->mask);
+			if ((sid ^ id) & ~mask)
+				continue;
+			matches++;
+			if (first >= 0)
+				continue;
+			first = i;
+			first_id = id;
+			first_mask = mask;
+			type = READ_ONCE(smmu->s2crs[i].type);
+			cbndx = READ_ONCE(smmu->s2crs[i].cbndx);
+			count = READ_ONCE(smmu->s2crs[i].count);
+		}
+		dev_info(smmu->dev,
+			 "joan-smmu-trace: %s sw-shadow sid=%#x matches=%u first=%d id=%#x mask=%#x type=%d cbndx=%d count=%d\n",
+			 event, sid, matches, first, first_id, first_mask,
+			 type, cbndx, count);
+	}
+}
+
+/* Read the visible global fault state once, without acknowledging it. */
+static void joan_mmss_smmu_fault_sample(struct arm_smmu_device *smmu)
+{
+	u32 gfsr, gfsynr1;
+
+	if (smmu->ioaddr != 0xcd00000 ||
+	    !of_device_is_compatible(smmu->dev->of_node, "qcom,msm8998-smmu-v2"))
+		return;
+
+	dev_info(smmu->dev,
+		 "joan-smmu-fault: suspend before read sGFSR offset=%#x\n",
+		 ARM_SMMU_GR0_sGFSR);
+	gfsr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSR);
+	dev_info(smmu->dev, "joan-smmu-fault: suspend sGFSR=%#x\n", gfsr);
+	if (!(gfsr & ARM_SMMU_sGFSR_USF))
+		return;
+
+	dev_info(smmu->dev,
+		 "joan-smmu-fault: suspend before read sGFSYNR1 offset=%#x\n",
+		 ARM_SMMU_GR0_sGFSYNR1);
+	gfsynr1 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSYNR1);
+	dev_info(smmu->dev,
+		 "joan-smmu-fault: suspend sGFSYNR1=%#x sid=%#x\n",
+		 gfsynr1, gfsynr1 & 0xffff);
+}
+
 static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
 {
 	int i;
 	u32 reg;
 
+	joan_mmss_smmu_trace(smmu, "reset-enter", 0, true);
+
 	/* clear global FSR */
 	reg = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSR);
+	if (smmu->ioaddr == 0xcd00000 &&
+	    of_device_is_compatible(smmu->dev->of_node, "qcom,msm8998-smmu-v2"))
+		dev_info(smmu->dev, "joan-smmu-fault: reset-preclear sGFSR=%#x\n", reg);
 	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sGFSR, reg);
 
 	/*
@@ -1715,6 +1795,7 @@ static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
 	/* Push the button */
 	arm_smmu_tlb_sync_global(smmu);
 	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sCR0, reg);
+	joan_mmss_smmu_trace(smmu, "reset-return", 0, false);
 }
 
 static int arm_smmu_id_size_to_bits(int size)
@@ -2291,12 +2372,16 @@ static int __maybe_unused arm_smmu_runtime_resume(struct device *dev)
 	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
 	int ret;
 
+	joan_mmss_smmu_trace(smmu, "runtime-resume-enter", 0, false);
 	ret = clk_bulk_enable(smmu->num_clks, smmu->clks);
-	if (ret)
+	if (ret) {
+		joan_mmss_smmu_trace(smmu, "runtime-resume-return", ret, false);
 		return ret;
+	}
 
 	arm_smmu_device_reset(smmu);
 
+	joan_mmss_smmu_trace(smmu, "runtime-resume-return", 0, false);
 	return 0;
 }
 
@@ -2304,8 +2389,11 @@ static int __maybe_unused arm_smmu_runtime_suspend(struct device *dev)
 {
 	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
 
+	joan_mmss_smmu_trace(smmu, "runtime-suspend-enter", 0, false);
+	joan_mmss_smmu_fault_sample(smmu);
 	clk_bulk_disable(smmu->num_clks, smmu->clks);
 
+	joan_mmss_smmu_trace(smmu, "runtime-suspend-return", 0, false);
 	return 0;
 }
 

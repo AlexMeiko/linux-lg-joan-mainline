@@ -8,6 +8,14 @@
 
 #define VBIF_BASE				0x80000
 
+/*
+ * VBIF clock force-on. On some Venus revisions (e.g. msm8998 / Venus 3.x)
+ * the VBIF register window stays clock-gated until this bit is set: any
+ * access before that hangs the interconnect and resets the SoC.
+ */
+#define VBIF_CLK_ON				0x4
+#define VBIF_CLK_ON_FORCE_ON			BIT(0)
+
 #define VBIF_AXI_HALT_CTRL0			0x208
 #define VBIF_AXI_HALT_CTRL1			0x20c
 

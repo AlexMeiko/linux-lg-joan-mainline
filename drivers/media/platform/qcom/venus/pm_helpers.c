@@ -8,6 +8,7 @@
 #include <linux/interconnect.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
@@ -44,6 +45,8 @@ static int core_clks_enable(struct venus_core *core)
 	unsigned int freq_tbl_size = core->res->freq_tbl_size;
 	const struct venus_resources *res = core->res;
 	struct device *dev = core->dev;
+	bool msm8998_bootstrap = of_device_is_compatible(dev->of_node,
+						       "qcom,msm8998-venus");
 	unsigned long freq = 0;
 	struct dev_pm_opp *opp;
 	unsigned int i;
@@ -58,14 +61,29 @@ static int core_clks_enable(struct venus_core *core)
 		dev_pm_opp_put(opp);
 	}
 
+	/* 后续 runtime resume 保留会话协商出的更高频率。 */
+	if (msm8998_bootstrap)
+		freq = max(freq, clk_get_rate(core->clks[0]));
+
 	for (i = 0; i < res->clks_num; i++) {
-		if (IS_V6(core) || (IS_V4(core) && is_lite(core))) {
+		/* MSM8998 在 PAS 之前使用已选最低频率，不等首个 session。 */
+		if (msm8998_bootstrap && !i)
+			dev_info(dev, "joan-venus-trace: bootclk: before set core rate=%lu target=%lu\n",
+				 clk_get_rate(core->clks[i]), freq);
+		if (IS_V6(core) || (IS_V4(core) && is_lite(core)) ||
+		    (msm8998_bootstrap && !i)) {
 			ret = clk_set_rate(core->clks[i], freq);
+			if (msm8998_bootstrap && !i)
+				dev_info(dev, "joan-venus-trace: bootclk: set core ret=%d rate=%lu\n",
+					 ret, clk_get_rate(core->clks[i]));
 			if (ret)
 				goto err;
 		}
 
 		ret = clk_prepare_enable(core->clks[i]);
+		if (msm8998_bootstrap)
+			dev_info(dev, "joan-venus-trace: bootclk: enable %s ret=%d rate=%lu\n",
+				 res->clks[i], ret, clk_get_rate(core->clks[i]));
 		if (ret)
 			goto err;
 	}
