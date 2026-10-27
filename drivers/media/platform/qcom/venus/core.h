@@ -218,6 +218,8 @@ struct venus_core {
 		size_t mem_size;
 	} fw;
 	struct mutex lock;
+	struct mutex joan_seq_lock;
+	struct mutex joan_cfg_lock;
 	struct list_head instances;
 	atomic_t insts_count;
 	unsigned int state;

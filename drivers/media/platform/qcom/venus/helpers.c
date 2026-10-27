@@ -28,7 +28,7 @@
 #include <linux/string.h>
 
 /* 候选 27：解码输入 flags 开关（bit0=CODECCONFIG, bit1=ENDOFFRAME），默认 0 */
-unsigned int joan_enc_cap_before_input = 1;
+unsigned int joan_enc_cap_before_input;
 module_param(joan_enc_cap_before_input, uint, 0644);
 MODULE_PARM_DESC(joan_enc_cap_before_input, "joan: submit capture buffers before releasing input");
 EXPORT_SYMBOL_GPL(joan_enc_cap_before_input);
@@ -42,6 +42,18 @@ char joan_trace_ring[8192];
 static DEFINE_SPINLOCK(joan_trace_lock);
 unsigned int joan_trace_ring_pos;
 module_param_string(joan_trace_ring, joan_trace_ring, sizeof(joan_trace_ring), 0444);
+
+void joan_seq_lock(struct venus_inst *inst)
+{
+	mutex_lock(&inst->core->joan_seq_lock);
+}
+EXPORT_SYMBOL_GPL(joan_seq_lock);
+
+void joan_seq_unlock(struct venus_inst *inst)
+{
+	mutex_unlock(&inst->core->joan_seq_lock);
+}
+EXPORT_SYMBOL_GPL(joan_seq_unlock);
 
 void joan_tlog(const char *fmt, ...)
 {

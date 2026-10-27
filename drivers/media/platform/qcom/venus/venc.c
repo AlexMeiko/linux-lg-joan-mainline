@@ -1560,20 +1560,14 @@ static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 			hb->joan_held = true;
 			joan_stat_hold++;
 			list_add_tail(&hb->joan_list, &inst->joan_held_caps);
-			/*
-			 * 候选 150：必须挂进 v4l2-m2m 的 ready 队列，否则固件回来的
-			 * 填缓冲完成事件按 index 找不到缓冲（remove_by_idx 只查 ready
-			 * 队列），完成事件会被静默丢弃，ffmpeg 永远等不到帧。
-			 * 只入队、不提交——提交留给 start_streaming 里的计数提交，
-			 * 保证每个缓冲只进固件一次。
-			 */
-			v4l2_m2m_buf_queue(inst->m2m_ctx, vbuf);
+
 			/*
 			 * 候选 147：这里只能"持有"，绝不能再调
 			 * venus_helper_vb2_buf_queue() —— 自动启动后两个队列都已置位，
 			 * 那个 helper 会立刻把缓冲提交给固件，随后 start_streaming
 			 * 里的计数提交又会提交一次，重复提交直接把固件打崩。
 			 */
+			venus_helper_vb2_buf_queue(vb);
 			JOAN_VTRACE("venc_buf_queue: 持有捕获 idx=%u", vb->index);
 		}
 		mutex_unlock(&inst->lock);

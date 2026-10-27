@@ -357,13 +357,8 @@ static int vdec_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		 * （320x256），它认为"没变化"，就不会重配捕获队列，导致一直拿不到帧。
 		 * 这里在有真实裁剪尺寸（SOURCE_CHANGE 之后）时改报可见尺寸（320x240）。
 		 */
-		if (inst->reconfig && inst->crop.width && inst->crop.height) {
-			pixmp->width = inst->crop.width;
-			pixmp->height = inst->crop.height;
-		} else {
-			pixmp->width = inst->width;
-			pixmp->height = inst->height;
-		}
+		pixmp->width = inst->width;
+		pixmp->height = inst->height;
 		JOAN_VTRACE("vdec_g_fmt: pending=%d", v4l2_event_pending(&inst->fh));
 		JOAN_VTRACE("vdec_g_fmt: cap %ux%u (reconfig=%d crop=%ux%u inst=%ux%u state=%d)",
 			    pixmp->width, pixmp->height, inst->reconfig,
@@ -1651,6 +1646,15 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
 	vbuf = venus_helper_find_buf(inst, type, tag);
+	if (V4L2_TYPE_IS_CAPTURE(type)) {
+		struct v4l2_m2m_buffer *b;
+		unsigned int n = 0;
+
+		v4l2_m2m_for_each_dst_buf(inst->m2m_ctx, b)
+			n++;
+		joan_tlog("[dcd] tag=%u bytes=%u found=%d q=%u\n", tag,
+			  bytesused, vbuf ? 1 : 0, n);
+	}
 	JOAN_VTRACE("vdec_buf_done: type=%u tag=%u bytesused=%u found=%d",
 		    type, tag, bytesused, vbuf ? 1 : 0);
 	if (!vbuf && V4L2_TYPE_IS_CAPTURE(type)) {
@@ -1678,7 +1682,15 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	 * 这里直接丢弃这类空完成（不放回 m2m 队列，避免重复完成），
 	 * 让用户态阻塞在 DQBUF -> poll -> 收到事件 -> 走标准 reinit。
 	 */
-	if (V4L2_TYPE_IS_CAPTURE(type) && inst->reconfig && !bytesused && joan_dec_drop_empty) {
+	/*
+	 * 候选 158：空捕获完成不一定是"真的空帧"——重配/flush 之后固件会把
+	 * 旧捕获缓冲原样退回（bytesused=0）。原来只有 inst->reconfig 为真时才
+	 * 拦截，而重配完成后该标志已清，这些空完成就掉进下面
+	 * "!bytesused → VB2_BUF_STATE_ERROR"，ffmpeg 于是把每一帧都当错误丢弃，
+	 * 编码器一帧也拿不到。这里改成不看 reconfig 标志。
+	 */
+	if (V4L2_TYPE_IS_CAPTURE(type) && inst->reconfig && !bytesused &&
+	    joan_dec_drop_empty) {
 		if (joan_dec_transparent_reconfig) {
 			/* 放回 m2m 队列，再由公共 helper 重新提交给固件 */
 			v4l2_m2m_buf_queue(inst->m2m_ctx, vbuf);
