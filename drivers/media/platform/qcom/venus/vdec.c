@@ -1857,22 +1857,6 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		inst->joan_dec_ts_seen = true;
 	}
 
-	if (V4L2_TYPE_IS_CAPTURE(type)) {
-		static unsigned int joan_dump;
-		void *d = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
-
-		if (d && joan_dump < 6) {
-			joan_dump++;
-			joan_tlog("[dump%u] tag=%u used=%u: %02x %02x %02x %02x %02x %02x %02x %02x | @76800 %02x %02x | @98304 %02x %02x | @138240 %02x %02x\n",
-				  joan_dump, tag, bytesused,
-				  ((u8 *)d)[0], ((u8 *)d)[1], ((u8 *)d)[2], ((u8 *)d)[3],
-				  ((u8 *)d)[4], ((u8 *)d)[5], ((u8 *)d)[6], ((u8 *)d)[7],
-				  ((u8 *)d)[76800], ((u8 *)d)[76801],
-				  ((u8 *)d)[98304], ((u8 *)d)[98305],
-				  ((u8 *)d)[138240], ((u8 *)d)[138241]);
-		}
-	}
-
 	v4l2_m2m_buf_done(vbuf, state);
 }
 
@@ -2224,6 +2208,14 @@ static int vdec_close(struct file *file)
 
 	vdec_pm_get(inst);
 	cancel_work_sync(&inst->delayed_process_work);
+	/*
+	 * joan_reconf_work 会拿 inst->lock 并调用 hfi_session_flush() /
+	 * vdec_reconfigure()。原来 close 只取消了 delayed_process_work，
+	 * 重配工作若还在排队或正在运行，venus_close_common() 释放队列与
+	 * mutex、随后 kfree(inst) 之后它仍会访问 inst —— 典型的 use-after-free。
+	 * 必须在销毁实例之前同步取消。
+	 */
+	cancel_work_sync(&inst->joan_reconf_work);
 	venus_close_common(inst, file);
 	ida_destroy(&inst->dpb_ids);
 	vdec_pm_put(inst, false);

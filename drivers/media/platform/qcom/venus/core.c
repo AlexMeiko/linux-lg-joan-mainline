@@ -170,13 +170,19 @@ static void venus_sys_error_handler(struct work_struct *work)
 		failed = true;
 	}
 
+	/*
+	 * IRQ 必须在 hfi_core_resume() 之前恢复。
+	 * hfi_core_resume() 会发 SYS_INIT 并 wait_for_completion()，而那个
+	 * completion 只有 ISR 收到 SYS_INIT_DONE 才会触发。原来 enable_irq()
+	 * 排在它后面 —— IRQ 关着，响应永远收不到，这里必然超时。
+	 */
+	enable_irq(core->irq);
+
 	ret = hfi_core_resume(core, true);
 	if (ret && !failed) {
 		err_msg = "resume HFI";
 		failed = true;
 	}
-
-	enable_irq(core->irq);
 
 	mutex_unlock(&core->lock);
 

@@ -333,14 +333,17 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		inst->out_width = format.fmt.pix_mp.width;
 		inst->out_height = format.fmt.pix_mp.height;
 		/*
-		 * 候选 130：这里必须记录「应用请求的可见尺寸」（orig_pixmp），
-		 * 而不是驱动对齐后的 out_width（320x240 会被对齐成 384x240）。
-		 * 固件只接受可见尺寸的填入长度（320x240 NV12 = 115200）。
+		 * 记录「可见尺寸」，用于把固件的 filled_len 截到真实帧大小。
+		 *
+		 * 两点必须注意：
+		 * 1) 不能用对齐后的 out_width —— 我们已不再把可见宽度扩到 128 倍数，
+		 *    format 里的宽高就是可见值（已被 try_fmt_common 夹到 16..4096）。
+		 * 2) 不能只在第一次 S_FMT 记录 —— 同一个 fd 从 320x240 改到 1080p 时
+		 *    旧值会把 filled_len 截成 115200，固件只能拿到小半帧。
+		 * 用 clamp 后的值同时避免了用 orig_pixmp 原值做 u32 乘法溢出。
 		 */
-		if (!inst->joan_vis_w) {
-			inst->joan_vis_w = orig_pixmp.width;
-			inst->joan_vis_h = orig_pixmp.height;
-		}
+		inst->joan_vis_w = format.fmt.pix_mp.width;
+		inst->joan_vis_h = format.fmt.pix_mp.height;
 		inst->colorspace = pixmp->colorspace;
 		inst->ycbcr_enc = pixmp->ycbcr_enc;
 		inst->quantization = pixmp->quantization;
@@ -1344,9 +1347,20 @@ static void venc_buf_cleanup(struct vb2_buffer *vb)
 	struct venus_buffer *buf = to_venus_buffer(vbuf);
 
 	mutex_lock(&inst->lock);
-	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		if (!list_empty(&inst->registeredbufs))
 			list_del_init(&buf->reg_list);
+		/*
+		 * 缓冲要被销毁了，必须先从"持有"链表摘掉。
+		 * 否则启动失败/REQBUFS(0) 之后链表里会留下指向已释放缓冲的节点，
+		 * 后续遍历就是 use-after-free；残留的 joan_held 还会让重新
+		 * 入队的缓冲被跳过（永远不提交给固件）。
+		 */
+		if (buf->joan_held) {
+			list_del_init(&buf->joan_list);
+			buf->joan_held = false;
+		}
+	}
 	mutex_unlock(&inst->lock);
 
 	inst->buf_count--;
@@ -1763,6 +1777,14 @@ static int venc_buf_prepare(struct vb2_buffer *vb)
 		       dst_stride * (ALIGN(uv_rows, 16) - uv_rows));
 	dma_wmb();
 
+	/*
+	 * 重排是原地改内容、不幂等：用户态 DQBUF 后不重写内容就再次 QBUF 时，
+	 * 会把已转换好的数据再搬一次（4K 实测 414 万个字节被破坏）。
+	 * 把 payload 改成硬件布局的完整大小，再次 QBUF 就会命中上面
+	 * "已经是硬件布局"的判断直接跳过；用户态若重新写入紧凑帧并恢复
+	 * payload，仍会正常重排。
+	 */
+	vb2_set_plane_payload(vb, 0, dst_uv + dst_stride * ALIGN(uv_rows, 16));
 	return 0;
 }
 

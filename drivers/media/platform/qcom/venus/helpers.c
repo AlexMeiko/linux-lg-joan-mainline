@@ -379,6 +379,17 @@ static int intbufs_unset_buffers(struct venus_inst *inst)
 		bd.response_required = true;
 
 		ret = hfi_session_unset_buffers(inst, &bd);
+		if (ret) {
+			/*
+			 * unset 失败/超时不等于固件已经停止访问这块内存。
+			 * 此时释放就是硬件层面的 use-after-free（固件仍可能写），
+			 * 宁可泄漏也不要冒这个险；保留在链表里，下次还能重试。
+			 */
+			dev_err(inst->core->dev,
+				"joan: unset buffer type=%#x 失败 %d，保留内存不释放\n",
+				buf->type, ret);
+			continue;
+		}
 
 		list_del_init(&buf->list);
 		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
@@ -470,6 +481,13 @@ int venus_helper_intbufs_realloc(struct venus_inst *inst)
 		bd.response_required = true;
 
 		ret = hfi_session_unset_buffers(inst, &bd);
+		if (ret) {
+			/* 同上：unset 失败时固件可能还在写，不能释放 */
+			dev_err(inst->core->dev,
+				"joan: unset buffer type=%#x 失败 %d，保留内存不释放\n",
+				buf->type, ret);
+			continue;
+		}
 
 		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
 			       buf->attrs);
@@ -580,9 +598,14 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 	struct hfi_frame_data fdata;
 	int ret;
 
-	/* Ready queues also contain buffers which firmware is still processing. */
-	if (joan_dec_clean_stream &&
-	    inst->session_type == VIDC_SESSION_TYPE_DEC && buf->joan_submitted)
+	/*
+	 * Ready queue 里可能还留着固件正在处理的缓冲（mem2mem 的 ready 队列
+	 * 与"固件所有权"不是一回事）。原来这个去重只对解码方向生效，
+	 * 编码的 CAPTURE 缓冲虽然也置了 joan_submitted，却没有检查，
+	 * 于是 device_run 可能把固件正在用的缓冲再提交一次。
+	 * 现在两个方向统一按标志去重；标志在完成路径与 stop 路径清除。
+	 */
+	if (buf->joan_submitted)
 		return 0;
 
 	memset(&fdata, 0, sizeof(fdata));
@@ -1703,16 +1726,26 @@ void venus_helper_buffers_done(struct venus_inst *inst, unsigned int type,
 
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		while ((buf = v4l2_m2m_src_buf_remove(inst->m2m_ctx))) {
-			if (joan_dec_clean_stream &&
-			    inst->session_type == VIDC_SESSION_TYPE_DEC)
-				to_venus_buffer(buf)->joan_submitted = false;
+			to_venus_buffer(buf)->joan_submitted = false;
 			v4l2_m2m_buf_done(buf, state);
 		}
 	} else if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		/*
+		 * 停止时把"持有"链表整个清空。启动失败会把捕获缓冲归还给
+		 * 用户态，但它们若还挂在 joan_held_caps 里，joan_held 仍为 true，
+		 * 重新入队时会被跳过 —— 编码器就再也跑不起来。
+		 */
+		if (inst->session_type == VIDC_SESSION_TYPE_ENC) {
+			struct venus_buffer *h, *tmp;
+
+			list_for_each_entry_safe(h, tmp, &inst->joan_held_caps,
+						 joan_list) {
+				list_del_init(&h->joan_list);
+				h->joan_held = false;
+			}
+		}
 		while ((buf = v4l2_m2m_dst_buf_remove(inst->m2m_ctx))) {
-			if (joan_dec_clean_stream &&
-			    inst->session_type == VIDC_SESSION_TYPE_DEC)
-				to_venus_buffer(buf)->joan_submitted = false;
+			to_venus_buffer(buf)->joan_submitted = false;
 			v4l2_m2m_buf_done(buf, state);
 		}
 	}
