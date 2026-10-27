@@ -5,6 +5,12 @@
  */
 #include <linux/slab.h>
 #include <linux/mutex.h>
+
+#ifndef JOAN_VTRACE
+#define JOAN_VTRACE(fmt, ...) do { \
+	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
+} while (0)
+#endif
 #include <linux/list.h>
 #include <linux/completion.h>
 #include <linux/platform_device.h>
@@ -127,10 +133,35 @@ int hfi_core_suspend(struct venus_core *core)
 
 int hfi_core_resume(struct venus_core *core, bool force)
 {
+	int ret;
+
 	if (!force && core->state != CORE_INIT)
 		return 0;
 
-	return core->ops->resume(core);
+	ret = core->ops->resume(core);
+	if (ret)
+		return ret;
+
+	/*
+	 * 候选 49：resume 走 venus_power_on -> venus_run -> venus_boot_core，
+	 * 其中 PAS auth_and_reset 会把 ARM9 **重新启动**，固件侧 HFI 状态清零。
+	 * 原实现只做 power_on，不重发 HFI_CMD_SYS_INIT，于是空闲掉电再恢复后
+	 * 第一次会话必然失败（实测：连续编码 600 帧无错，空闲 60 秒后下一次必失败）。
+	 * 这里把状态标记为未初始化并重做 SYS_INIT 握手。
+	 */
+	core->state = CORE_UNINIT;
+	reinit_completion(&core->done);
+	ret = core->ops->core_init(core);
+	if (ret)
+		return ret;
+	ret = wait_for_completion_timeout(&core->done, TIMEOUT);
+	if (!ret)
+		return -ETIMEDOUT;
+	if (core->error != HFI_ERR_NONE)
+		return -EIO;
+	core->state = CORE_INIT;
+
+	return 0;
 }
 
 int hfi_core_trigger_ssr(struct venus_core *core, u32 type)
@@ -213,10 +244,13 @@ int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
 	reinit_completion(&inst->done);
 
 	ret = ops->session_init(inst, inst->session_type, inst->hfi_codec);
+	JOAN_VTRACE("hfi_session_init: ops->session_init ret=%d type=%u codec=%u",
+		    ret, inst->session_type, inst->hfi_codec);
 	if (ret)
 		return ret;
 
 	ret = wait_session_msg(inst);
+	JOAN_VTRACE("hfi_session_init: wait_session_msg ret=%d", ret);
 	if (ret)
 		return ret;
 
@@ -506,10 +540,19 @@ int hfi_session_set_property(struct venus_inst *inst, u32 ptype, void *pdata)
 	if (test_bit(0, &inst->core->sys_error))
 		return -EIO;
 
-	if (inst->state < INST_INIT || inst->state >= INST_STOP)
+	if (inst->state < INST_INIT || inst->state >= INST_STOP) {
+		JOAN_VTRACE("hfi_set_property: ptype=%#x EINVAL state=%d",
+			    ptype, inst->state);
 		return -EINVAL;
+	}
 
-	return ops->session_set_property(inst, ptype, pdata);
+	{
+		int __ret = ops->session_set_property(inst, ptype, pdata);
+
+		JOAN_VTRACE("hfi_set_property: ptype=%#x ret=%d state=%d",
+			    ptype, __ret, inst->state);
+		return __ret;
+	}
 }
 EXPORT_SYMBOL_GPL(hfi_session_set_property);
 
@@ -520,11 +563,20 @@ int hfi_session_process_buf(struct venus_inst *inst, struct hfi_frame_data *fd)
 	if (test_bit(0, &inst->core->sys_error))
 		return -EIO;
 
-	if (fd->buffer_type == HFI_BUFFER_INPUT)
-		return ops->session_etb(inst, fd);
-	else if (fd->buffer_type == HFI_BUFFER_OUTPUT ||
-		 fd->buffer_type == HFI_BUFFER_OUTPUT2)
-		return ops->session_ftb(inst, fd);
+	{
+		int __ret;
+
+		if (fd->buffer_type == HFI_BUFFER_INPUT)
+			__ret = ops->session_etb(inst, fd);
+		else if (fd->buffer_type == HFI_BUFFER_OUTPUT ||
+			 fd->buffer_type == HFI_BUFFER_OUTPUT2)
+			__ret = ops->session_ftb(inst, fd);
+		else
+			return 0;
+		JOAN_VTRACE("process_buf: type=%u bytes=%u ret=%d",
+			    fd->buffer_type, fd->alloc_len, __ret);
+		return __ret;
+	}
 
 	return -EINVAL;
 }

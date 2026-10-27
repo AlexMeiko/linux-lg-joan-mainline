@@ -4,6 +4,21 @@
  * Copyright (C) 2017 Linaro Ltd.
  */
 #include <linux/types.h>
+#include <linux/module.h>
+
+unsigned int joan_enc_allow_separate = 1;
+module_param(joan_enc_allow_separate, uint, 0644);
+MODULE_PARM_DESC(joan_enc_allow_separate, "joan: accept HEADER_MODE_SEPARATE");
+
+unsigned int joan_enc_force_joined = 1;
+module_param(joan_enc_force_joined, uint, 0644);
+MODULE_PARM_DESC(joan_enc_force_joined, "joan: force JOINED header mode in firmware");
+
+#ifndef JOAN_VTRACE
+#define JOAN_VTRACE(fmt, ...) do { \
+	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
+} while (0)
+#endif
 #include <media/v4l2-ctrls.h>
 
 #include "core.h"
@@ -86,6 +101,7 @@ static int dynamic_bitrate_update(struct venus_inst *inst, u32 bitrate,
 
 static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 {
+	JOAN_VTRACE("venc_s_ctrl: id=%#x val=%d", ctrl->id, ctrl->val);
 	struct venus_inst *inst = ctrl_to_inst(ctrl);
 	struct venc_controls *ctr = &inst->controls.enc;
 	struct hfi_enable en = { .enable = 1 };
@@ -217,7 +233,24 @@ static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctr->h264_loop_filter_mode = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
-		ctr->header_mode = ctrl->val;
+		/*
+		 * 候选 45：这个驱动没有实现「单独取序列头」的通道（没有对应的事件/控件
+		 * 把 SPS/PPS 交回用户态）。若允许 ffmpeg 把 header_mode 设成 SEPARATE，
+		 * 产出的码流就没有 SPS/PPS（首字节直接是 0x65 IDR），软件解码器无法解析。
+		 * 因此这里拒绝 SEPARATE，保持 JOINED（SPS/PPS 随第一帧带出）。
+		 */
+		/*
+		 * 候选 99/100：ffmpeg 的 v4l2m2m 编码器会先设 SEPARATE，被拒会让它
+		 * 直接以 -EINVAL 中止（实测软解→硬编整条流水线失败）。这里接受该
+		 * 控件值，但在固件侧仍强制 JOINED（SPS/PPS 随第一帧带出）。
+		 */
+		if (ctrl->val == V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE &&
+		    !joan_enc_allow_separate) {
+			JOAN_VTRACE("venc_s_ctrl: HEADER_MODE=SEPARATE rejected");
+			return -EINVAL;
+		}
+		ctr->header_mode = joan_enc_force_joined ?
+			V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME : ctrl->val;
 		mutex_lock(&inst->lock);
 		if (inst->streamon_out && inst->streamon_cap) {
 			if (ctrl->val == V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE)

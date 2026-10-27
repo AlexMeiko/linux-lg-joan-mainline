@@ -333,6 +333,7 @@ struct venc_controls {
 struct venus_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
+	bool joan_held;
 	dma_addr_t dma_addr;
 	u32 size;
 	struct list_head reg_list;
@@ -452,6 +453,12 @@ enum venus_inst_modes {
  * @dpb_ids:	DPB buffer ID's
  */
 struct venus_inst {
+	struct work_struct joan_reconf_work;
+	struct list_head joan_held_caps;
+	bool joan_enc_running;
+	u32 joan_vis_w, joan_vis_h;
+	u32 joan_last_in_addr;
+	bool joan_first_in_sent;	/* 会话内是否已发过首个输入缓冲 */	/* EOS 空缓冲复用的真实输入地址 */
 	struct list_head list;
 	struct mutex lock;
 	struct venus_core *core;

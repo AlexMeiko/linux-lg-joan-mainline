@@ -12,6 +12,16 @@
 #include <linux/devcoredump.h>
 #include <linux/list.h>
 #include <linux/module.h>
+
+/* 候选 50：禁止运行时挂起（临时稳定化开关）*/
+unsigned int joan_no_rpm;
+module_param(joan_no_rpm, uint, 0644);
+MODULE_PARM_DESC(joan_no_rpm, "joan: forbid venus runtime suspend (0=normal, 1=always on)");
+
+/* 候选 36b：收到 HFI 系统错误后不做恢复（避免实验时把内核卡死） */
+unsigned int joan_no_recover;
+module_param(joan_no_recover, uint, 0644);
+MODULE_PARM_DESC(joan_no_recover, "joan: skip venus sys-error recovery (debug only)");
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
@@ -98,6 +108,12 @@ static void venus_sys_error_handler(struct work_struct *work)
 	struct venus_core *core =
 			container_of(work, struct venus_core, work.work);
 	int ret, i, max_attempts = RPM_WAIT_FOR_IDLE_MAX_ATTEMPTS;
+
+	if (joan_no_recover) {
+		JOAN_VTRACE("sys_error: joan_no_recover=1, skip recovery");
+		core->state = CORE_UNINIT;
+		return;
+	}
 	const char *err_msg = "";
 	bool failed = false;
 
@@ -112,7 +128,14 @@ static void venus_sys_error_handler(struct work_struct *work)
 	core->state = CORE_UNINIT;
 
 	for (i = 0; i < max_attempts; i++) {
-		if (!pm_runtime_active(core->dev_dec) && !pm_runtime_active(core->dev_enc))
+		/*
+		 * joan 修复：decoder/encoder 视频设备是各自模块 probe 时才注册的，
+		 * 只加载 venus-dec（或只加载 venus-enc）时另一个指针为 NULL。
+		 * 原代码直接 pm_runtime_active() 会空指针，把整个内核拖死
+		 * （实测 oops 在 venus_sys_error_handler+0x74，ldr w1,[x0,#0x19c]）。
+		 */
+		if ((!core->dev_dec || !pm_runtime_active(core->dev_dec)) &&
+		    (!core->dev_enc || !pm_runtime_active(core->dev_enc)))
 			break;
 		msleep(10);
 	}
@@ -877,6 +900,16 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_of_depopulate;
 
+	/*
+	 * 候选 50（临时稳定化开关）：msm8998 上「空闲掉电 -> 恢复」路径仍然会触发
+	 * 固件 System error（power_on/boot_core 都返回 0，随后报错并无法恢复）。
+	 * joan_no_rpm=1 时禁止运行时挂起，核心保持上电，换取稳定；
+	 * 默认 0，等恢复路径修好后再打开。
+	 */
+	if (joan_no_rpm) {
+		pm_runtime_forbid(dev);
+		JOAN_VTRACE("probe: runtime PM forbidden (joan_no_rpm=1)");
+	}
 	ret = pm_runtime_put_sync(dev);
 	if (ret) {
 		pm_runtime_get_noresume(dev);

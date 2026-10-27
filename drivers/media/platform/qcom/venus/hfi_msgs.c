@@ -4,6 +4,12 @@
  * Copyright (C) 2017 Linaro Ltd.
  */
 #include <linux/hash.h>
+
+#ifndef JOAN_VTRACE
+#define JOAN_VTRACE(fmt, ...) do { \
+	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
+} while (0)
+#endif
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/smem.h>
@@ -152,6 +158,9 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 		num_properties_changed--;
 	} while (num_properties_changed > 0);
 
+	JOAN_VTRACE("seq_change: ev=%#x w=%u h=%u profile=%u level=%u props_left=%d",
+		    event.event_type, event.width, event.height,
+		    event.profile, event.level, num_properties_changed);
 	inst->ops->event_notify(inst, EVT_SYS_EVENT_CHANGE, &event);
 	return;
 
@@ -229,6 +238,9 @@ static void hfi_event_notify(struct venus_core *core, struct venus_inst *inst,
 
 	if (!packet)
 		return;
+
+	JOAN_VTRACE("event_notify: id=%#x data1=%#x data2=%#x",
+		    pkt->event_id, pkt->event_data1, pkt->event_data2);
 
 	switch (pkt->event_id) {
 	case HFI_EVENT_SYS_ERROR:
@@ -551,6 +563,14 @@ static void hfi_session_ftb_done(struct venus_core *core,
 	unsigned int error;
 	u32 flags = 0, hfi_flags = 0, offset = 0, filled_len = 0;
 	u32 pic_type = 0, buffer_type = 0, output_tag = -1;
+	const u32 *__raw = packet;
+
+	JOAN_VTRACE("ftb_raw: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+		    __raw[0], __raw[1], __raw[2], __raw[3], __raw[4], __raw[5],
+		    __raw[6], __raw[7], __raw[8], __raw[9], __raw[10], __raw[11],
+		    __raw[12], __raw[13], __raw[14], __raw[15], __raw[16], __raw[17],
+		    __raw[18], __raw[19], __raw[20], __raw[21], __raw[22], __raw[23],
+		    __raw[24], __raw[25], __raw[26], __raw[27]);
 
 	if (session_type == VIDC_SESSION_TYPE_ENC) {
 		struct hfi_msg_session_fbd_compressed_pkt *pkt = packet;
@@ -619,6 +639,9 @@ static void hfi_session_ftb_done(struct venus_core *core,
 
 done:
 	inst->error = error;
+	JOAN_VTRACE("ftb_done: sess=%u btype=%u tag=%u filled=%u err=%u hfi_flags=%#x pic=%#x v4l2_flags=%#x",
+		    session_type, buffer_type, output_tag, filled_len, error,
+		    hfi_flags, pic_type, flags);
 	inst->ops->buf_done(inst, buffer_type, output_tag, filled_len,
 			    offset, flags, hfi_flags, timestamp_us);
 }
@@ -819,6 +842,8 @@ u32 hfi_process_msg_packet(struct venus_core *core, struct hfi_pkt_hdr *hdr)
 		found = true;
 		break;
 	}
+
+	JOAN_VTRACE("msg: pkt_type=%#x size=%u found=%d", hdr->pkt_type, hdr->size, found);
 
 	if (!found)
 		return hdr->pkt_type;
