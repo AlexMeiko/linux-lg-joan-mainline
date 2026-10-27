@@ -333,17 +333,14 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		inst->out_width = format.fmt.pix_mp.width;
 		inst->out_height = format.fmt.pix_mp.height;
 		/*
-		 * 记录「可见尺寸」，用于把固件的 filled_len 截到真实帧大小。
-		 *
-		 * 两点必须注意：
-		 * 1) 不能用对齐后的 out_width —— 我们已不再把可见宽度扩到 128 倍数，
-		 *    format 里的宽高就是可见值（已被 try_fmt_common 夹到 16..4096）。
-		 * 2) 不能只在第一次 S_FMT 记录 —— 同一个 fd 从 320x240 改到 1080p 时
-		 *    旧值会把 filled_len 截成 115200，固件只能拿到小半帧。
-		 * 用 clamp 后的值同时避免了用 orig_pixmp 原值做 u32 乘法溢出。
+		 * 候选 130：这里必须记录「应用请求的可见尺寸」（orig_pixmp），
+		 * 而不是驱动对齐后的 out_width（320x240 会被对齐成 384x240）。
+		 * 固件只接受可见尺寸的填入长度（320x240 NV12 = 115200）。
 		 */
-		inst->joan_vis_w = format.fmt.pix_mp.width;
-		inst->joan_vis_h = format.fmt.pix_mp.height;
+		if (!inst->joan_vis_w) {
+			inst->joan_vis_w = orig_pixmp.width;
+			inst->joan_vis_h = orig_pixmp.height;
+		}
 		inst->colorspace = pixmp->colorspace;
 		inst->ycbcr_enc = pixmp->ycbcr_enc;
 		inst->quantization = pixmp->quantization;
@@ -667,64 +664,6 @@ unlock:
 	return ret;
 }
 
-/*
- * 原始输入队列固定使用 non-coherent（缓存）分配。
- *
- * 直接在 queue_setup 里写 q->non_coherent_mem 会和 vb2 的
- * verify_coherency_flags() 冲突：CREATE_BUFS 时它拿应用传入的 flags
- * （不含 NON_COHERENT）和 q->non_coherent_mem 比较，不一致就 -EINVAL。
- * 正确做法是让应用"看起来"请求了这个模式 —— 在 ioctl 入口补上标志，
- * 并给队列打开 allow_cache_hints，两处保持一致。
- */
-static void venc_force_non_coherent(struct v4l2_requestbuffers *rb)
-{
-	if (rb->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
-	    rb->memory == V4L2_MEMORY_MMAP)
-		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
-}
-
-static int venc_ioctl_reqbufs(struct file *file, void *priv,
-			      struct v4l2_requestbuffers *rb)
-{
-	venc_force_non_coherent(rb);
-	return v4l2_m2m_ioctl_reqbufs(file, priv, rb);
-}
-
-static int venc_ioctl_create_bufs(struct file *file, void *priv,
-				  struct v4l2_create_buffers *cb)
-{
-	if (cb->format.type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
-	    cb->memory == V4L2_MEMORY_MMAP)
-		cb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
-
-	return v4l2_m2m_ioctl_create_bufs(file, priv, cb);
-}
-
-/*
- * 队列开了 allow_cache_hints 之后，应用可以传 NO_CACHE_CLEAN /
- * NO_CACHE_INVALIDATE 让 vb2 跳过同步。但驱动在 buf_prepare 里要写缓冲
- * （NV12 重排），跳过同步会读到旧数据 / 写回不刷新。
- * 这两个队列不支持这种跳过，统一清掉。
- */
-static void venc_force_cache_sync(struct v4l2_buffer *b)
-{
-	b->flags &= ~(V4L2_BUF_FLAG_NO_CACHE_INVALIDATE |
-		      V4L2_BUF_FLAG_NO_CACHE_CLEAN);
-}
-
-static int venc_ioctl_prepare_buf(struct file *file, void *priv,
-				  struct v4l2_buffer *b)
-{
-	venc_force_cache_sync(b);
-	return v4l2_m2m_ioctl_prepare_buf(file, priv, b);
-}
-
-static int venc_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *b)
-{
-	venc_force_cache_sync(b);
-	return v4l2_m2m_ioctl_qbuf(file, priv, b);
-}
-
 static const struct v4l2_ioctl_ops venc_ioctl_ops = {
 	.vidioc_querycap = venc_querycap,
 	.vidioc_enum_fmt_vid_cap = venc_enum_fmt,
@@ -737,11 +676,11 @@ static const struct v4l2_ioctl_ops venc_ioctl_ops = {
 	.vidioc_try_fmt_vid_out_mplane = venc_try_fmt,
 	.vidioc_g_selection = venc_g_selection,
 	.vidioc_s_selection = venc_s_selection,
-	.vidioc_reqbufs = venc_ioctl_reqbufs,
+	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
-	.vidioc_create_bufs = venc_ioctl_create_bufs,
-	.vidioc_prepare_buf = venc_ioctl_prepare_buf,
-	.vidioc_qbuf = venc_ioctl_qbuf,
+	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
@@ -1257,6 +1196,14 @@ static int venc_queue_setup(struct vb2_queue *q,
 			    unsigned int *num_buffers, unsigned int *num_planes,
 			    unsigned int sizes[], struct device *alloc_devs[])
 {
+	/*
+	 * 默认 vb2_dma_contig 用 dma_alloc_coherent，在 arm64 上是非缓存内存，
+	 * CPU 往缓冲里搬 NV12 只有 ~390MB/s（实测 4K 每帧重排 10.5ms）。
+	 * 改走 non-coherent 路径可拿到缓存映射，vb2 会在 buf_prepare 之后
+	 * 自动 dma_sync_for_device、在 dequeue 前 sync_for_cpu，正确性不变。
+	 */
+	q->non_coherent_mem = true;
+
 	struct venus_inst *inst = vb2_get_drv_priv(q);
 	struct venus_core *core = inst->core;
 	unsigned int num, min = 4;
@@ -1397,20 +1344,9 @@ static void venc_buf_cleanup(struct vb2_buffer *vb)
 	struct venus_buffer *buf = to_venus_buffer(vbuf);
 
 	mutex_lock(&inst->lock);
-	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		if (!list_empty(&inst->registeredbufs))
 			list_del_init(&buf->reg_list);
-		/*
-		 * 缓冲要被销毁了，必须先从"持有"链表摘掉。
-		 * 否则启动失败/REQBUFS(0) 之后链表里会留下指向已释放缓冲的节点，
-		 * 后续遍历就是 use-after-free；残留的 joan_held 还会让重新
-		 * 入队的缓冲被跳过（永远不提交给固件）。
-		 */
-		if (buf->joan_held) {
-			list_del_init(&buf->joan_list);
-			buf->joan_held = false;
-		}
-	}
 	mutex_unlock(&inst->lock);
 
 	inst->buf_count--;
@@ -1827,14 +1763,6 @@ static int venc_buf_prepare(struct vb2_buffer *vb)
 		       dst_stride * (ALIGN(uv_rows, 16) - uv_rows));
 	dma_wmb();
 
-	/*
-	 * 重排是原地改内容、不幂等：用户态 DQBUF 后不重写内容就再次 QBUF 时，
-	 * 会把已转换好的数据再搬一次（4K 实测 414 万个字节被破坏）。
-	 * 把 payload 改成硬件布局的完整大小，再次 QBUF 就会命中上面
-	 * "已经是硬件布局"的判断直接跳过；用户态若重新写入紧凑帧并恢复
-	 * payload，仍会正常重排。
-	 */
-	vb2_set_plane_payload(vb, 0, dst_uv + dst_stride * ALIGN(uv_rows, 16));
 	return 0;
 }
 
@@ -1934,15 +1862,6 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
 	src_vq->mem_ops = &vb2_dma_contig_memops;
 	src_vq->drv_priv = inst;
 	src_vq->buf_struct_size = sizeof(struct venus_buffer);
-	/*
-	 * 只让原始（未压缩）输入队列接受 cache hints。
-	 * 编码器要在 venc_buf_prepare() 里把紧凑 NV12 重排成固件布局，
-	 * 非缓存内存下这一步 4K 每帧要 10.5ms；走 non-coherent 分配
-	 * （缓存映射 + vb2 自动 dma_sync）能降到 0.52ms。
-	 * 压缩码流的 CAPTURE 队列没有 CPU 拷贝，保持默认分配，
-	 * 这样它的 CREATE_BUFS 仍然可用。
-	 */
-	src_vq->allow_cache_hints = 1;
 	src_vq->allow_zero_bytesused = 1;
 	src_vq->min_queued_buffers = 1;
 	src_vq->dev = inst->core->dev;

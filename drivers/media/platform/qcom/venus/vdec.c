@@ -698,54 +698,6 @@ unlock:
 	return ret;
 }
 
-/*
- * 解码捕获队列固定使用 non-coherent（缓存）分配，理由见队列初始化处。
- * 和编码侧一样，不能直接写 q->non_coherent_mem（会和 CREATE_BUFS 的
- * verify_coherency_flags 冲突），而是在 ioctl 入口补标志。
- */
-static void vdec_force_non_coherent(struct v4l2_requestbuffers *rb)
-{
-	if (rb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
-	    rb->memory == V4L2_MEMORY_MMAP)
-		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
-}
-
-static int vdec_ioctl_reqbufs(struct file *file, void *priv,
-			      struct v4l2_requestbuffers *rb)
-{
-	vdec_force_non_coherent(rb);
-	return v4l2_m2m_ioctl_reqbufs(file, priv, rb);
-}
-
-static int vdec_ioctl_create_bufs(struct file *file, void *priv,
-				  struct v4l2_create_buffers *cb)
-{
-	if (cb->format.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
-	    cb->memory == V4L2_MEMORY_MMAP)
-		cb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
-
-	return v4l2_m2m_ioctl_create_bufs(file, priv, cb);
-}
-
-static void vdec_force_cache_sync(struct v4l2_buffer *b)
-{
-	b->flags &= ~(V4L2_BUF_FLAG_NO_CACHE_INVALIDATE |
-		      V4L2_BUF_FLAG_NO_CACHE_CLEAN);
-}
-
-static int vdec_ioctl_prepare_buf(struct file *file, void *priv,
-				  struct v4l2_buffer *b)
-{
-	vdec_force_cache_sync(b);
-	return v4l2_m2m_ioctl_prepare_buf(file, priv, b);
-}
-
-static int vdec_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *b)
-{
-	vdec_force_cache_sync(b);
-	return v4l2_m2m_ioctl_qbuf(file, priv, b);
-}
-
 static const struct v4l2_ioctl_ops vdec_ioctl_ops = {
 	.vidioc_querycap = vdec_querycap,
 	.vidioc_enum_fmt_vid_cap = vdec_enum_fmt,
@@ -757,11 +709,11 @@ static const struct v4l2_ioctl_ops vdec_ioctl_ops = {
 	.vidioc_try_fmt_vid_cap_mplane = vdec_try_fmt,
 	.vidioc_try_fmt_vid_out_mplane = vdec_try_fmt,
 	.vidioc_g_selection = vdec_g_selection,
-	.vidioc_reqbufs = vdec_ioctl_reqbufs,
+	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
-	.vidioc_create_bufs = vdec_ioctl_create_bufs,
-	.vidioc_prepare_buf = vdec_ioctl_prepare_buf,
-	.vidioc_qbuf = vdec_ioctl_qbuf,
+	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
@@ -1103,13 +1055,12 @@ static int vdec_queue_setup(struct vb2_queue *q,
 			    unsigned int sizes[], struct device *alloc_devs[])
 {
 	/*
-	 * 解码侧**不**启用 non_coherent_mem：
-	 * - 解码路径没有 CPU 拷贝，实测 cached/uncached 都是 ~216 fps（1080p）；
-	 * - 它会让 vb2_core_create_bufs() 的 verify_coherency_flags() 失败
-	 *   （应用不传 V4L2_MEMORY_FLAG_NON_COHERENT，而我们置了 1），
-	 *   于是 REQBUFS 之后再 CREATE_BUFS 的应用会拿到 -EINVAL。
-	 * 这个代价只在确实需要缓存映射的编码侧重排上才值得付。
+	 * 默认 vb2_dma_contig 用 dma_alloc_coherent，在 arm64 上是非缓存内存，
+	 * CPU 往缓冲里搬 NV12 只有 ~390MB/s（实测 4K 每帧重排 10.5ms）。
+	 * 改走 non-coherent 路径可拿到缓存映射，vb2 会在 buf_prepare 之后
+	 * 自动 dma_sync_for_device、在 dequeue 前 sync_for_cpu，正确性不变。
 	 */
+	q->non_coherent_mem = true;
 
 	struct venus_inst *inst = vb2_get_drv_priv(q);
 	struct venus_core *core = inst->core;
@@ -1474,15 +1425,12 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * 同一个 fd 上先后解两个文件时，上一路流的 last_ts 会让新流的
 	 * 第一帧被判成"时间戳回退"并被强行加大，时间轴就错了。
 	 */
-	/*
-	 * 任意一个队列重新启动都要清掉时间戳回退状态。
-	 * 只解绑输出队列（seek/换流）时捕获队列不会重新 streamon，
-	 * 若把重置放在 CAPTURE 分支里，旧时间戳会残留。
-	 */
-	inst->joan_dec_last_ts = 0;
-	inst->joan_dec_ts_seen = false;
-	inst->joan_dec_ts_fixups = 0;
-	inst->joan_dec_empty_recycled = 0;
+	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		inst->joan_dec_last_ts = 0;
+		inst->joan_dec_ts_seen = false;
+		inst->joan_dec_ts_fixups = 0;
+		inst->joan_dec_empty_recycled = 0;
+	}
 	JOAN_VTRACE("vdec_start_streaming: type=%d count=%u", q->type, count);
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		ret = vdec_start_capture(inst);
@@ -1909,6 +1857,22 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		inst->joan_dec_ts_seen = true;
 	}
 
+	if (V4L2_TYPE_IS_CAPTURE(type)) {
+		static unsigned int joan_dump;
+		void *d = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
+
+		if (d && joan_dump < 6) {
+			joan_dump++;
+			joan_tlog("[dump%u] tag=%u used=%u: %02x %02x %02x %02x %02x %02x %02x %02x | @76800 %02x %02x | @98304 %02x %02x | @138240 %02x %02x\n",
+				  joan_dump, tag, bytesused,
+				  ((u8 *)d)[0], ((u8 *)d)[1], ((u8 *)d)[2], ((u8 *)d)[3],
+				  ((u8 *)d)[4], ((u8 *)d)[5], ((u8 *)d)[6], ((u8 *)d)[7],
+				  ((u8 *)d)[76800], ((u8 *)d)[76801],
+				  ((u8 *)d)[98304], ((u8 *)d)[98305],
+				  ((u8 *)d)[138240], ((u8 *)d)[138241]);
+		}
+	}
+
 	v4l2_m2m_buf_done(vbuf, state);
 }
 
@@ -2161,12 +2125,6 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
 	if (ret)
 		return ret;
 
-	/*
-	 * 解码输出（NV12 帧）是用户态要读的数据。非缓存内存下 CPU 读很慢：
-	 * 4K 转码时解码缓冲 -> 编码缓冲的拷贝会把 4K 转码从 33 fps 拖到 19 fps
-	 * （实测）。开 cache hints 让 vb2 走缓存映射 + 自动 dma_sync。
-	 */
-	dst_vq->allow_cache_hints = 1;
 	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
@@ -2266,14 +2224,6 @@ static int vdec_close(struct file *file)
 
 	vdec_pm_get(inst);
 	cancel_work_sync(&inst->delayed_process_work);
-	/*
-	 * joan_reconf_work 会拿 inst->lock 并调用 hfi_session_flush() /
-	 * vdec_reconfigure()。原来 close 只取消了 delayed_process_work，
-	 * 重配工作若还在排队或正在运行，venus_close_common() 释放队列与
-	 * mutex、随后 kfree(inst) 之后它仍会访问 inst —— 典型的 use-after-free。
-	 * 必须在销毁实例之前同步取消。
-	 */
-	cancel_work_sync(&inst->joan_reconf_work);
 	venus_close_common(inst, file);
 	ida_destroy(&inst->dpb_ids);
 	vdec_pm_put(inst, false);

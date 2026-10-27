@@ -218,6 +218,8 @@ struct venus_core {
 		size_t mem_size;
 	} fw;
 	struct mutex lock;
+	struct mutex joan_seq_lock;
+	struct mutex joan_cfg_lock;
 	struct mutex joan_warm_lock;
 	struct venus_inst *joan_warm_enc;
 	struct list_head instances;
@@ -461,6 +463,7 @@ struct venus_inst {
 	struct list_head joan_held_caps;
 	bool joan_enc_running;
 	bool joan_cap_ready;
+	u32 joan_fb_n;
 	u64 joan_dec_last_ts;
 	u32 joan_dec_ts_fixups;
 	bool joan_dec_ts_seen;
