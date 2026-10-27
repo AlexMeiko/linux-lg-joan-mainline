@@ -11,29 +11,36 @@
 } while (0)
 #endif
 #include <linux/module.h>
-#include <linux/math64.h>
 
 /* 候选 76：reconfig 期间是否丢弃空的捕获完成（默认 0=正常完成）*/
 unsigned int joan_dec_drop_empty;
+module_param(joan_dec_drop_empty, uint, 0644);
+MODULE_PARM_DESC(joan_dec_drop_empty, "joan: drop empty capture completions during reconfig");
 
 /* 候选 70：是否在 SOURCE_CHANGE 之前就登记捕获缓冲（默认 1，解码需要）*/
 unsigned int joan_dec_early_cap_reg = 1;
+module_param(joan_dec_early_cap_reg, uint, 0644);
+MODULE_PARM_DESC(joan_dec_early_cap_reg, "joan: register capture buffers before source change");
 
 /* 候选 62：解码器收到序列变化后由驱动内部完成重配（对用户态透明）*/
-extern unsigned int joan_trace_quiet;
-
-unsigned int joan_dec_transparent_reconfig = 1;
-
-static bool joan_dec_ts_fallback = 1;
+unsigned int joan_dec_transparent_reconfig;
+module_param(joan_dec_transparent_reconfig, uint, 0644);
+MODULE_PARM_DESC(joan_dec_transparent_reconfig, "joan: handle decoder source change inside driver");
 
 /* 候选 51：解码 G_FMT 在 INIT 状态是否放行（默认 0，保持原语义）*/
-unsigned int joan_dec_gfmt_noblock = 1;
+unsigned int joan_dec_gfmt_noblock;
+module_param(joan_dec_gfmt_noblock, uint, 0644);
+MODULE_PARM_DESC(joan_dec_gfmt_noblock, "joan: allow decoder G_FMT before SOURCE_CHANGE");
 #include <linux/of.h>
 /* 候选 28：固件不发 SOURCE_CHANGE 时，强制走 reconfigure（分配 DPB + SESSION_CONTINUE）*/
 unsigned int joan_dec_force_reconfig;
+module_param(joan_dec_force_reconfig, uint, 0644);
+MODULE_PARM_DESC(joan_dec_force_reconfig, "joan: force decoder reconfigure path on capture start");
 
 /* 候选 33b：early reconfigure 跳过位（bit0=跳过 output_conf/set_num_bufs, bit1=跳过 DPB, bit2=跳过 CONTINUE）*/
 unsigned int joan_early_skip;
+module_param(joan_early_skip, uint, 0644);
+MODULE_PARM_DESC(joan_early_skip, "joan: skip steps in early reconfigure (1=conf 2=dpb 4=continue)");
 
 #include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
@@ -235,27 +242,11 @@ vdec_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 			return NULL;
 	}
 
-	/*
-	 * HEVC 的固件能力表里只有 BITRATE 项，没有 FRAME_WIDTH/HEIGHT，
-	 * 于是 frame_width_max() 返回 0，clamp(w, 0, 0) 会把宽高清零，
-	 * 固件拿到 0x0 的格式自然解不出东西（实测只消费 5 字节就停滞）。
-	 * 缺能力项时退回合理范围。
-	 */
-	{
-		u32 wmin = frame_width_min(inst), wmax = frame_width_max(inst);
-		u32 hmin = frame_height_min(inst), hmax = frame_height_max(inst);
+	pixmp->width = clamp(pixmp->width, frame_width_min(inst),
+			     frame_width_max(inst));
+	pixmp->height = clamp(pixmp->height, frame_height_min(inst),
+			      frame_height_max(inst));
 
-		if (!wmax) {
-			wmin = 16;
-			wmax = 4096;
-		}
-		if (!hmax) {
-			hmin = 16;
-			hmax = 4096;
-		}
-		pixmp->width = clamp(pixmp->width, wmin, wmax);
-		pixmp->height = clamp(pixmp->height, hmin, hmax);
-	}
 	if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		pixmp->height = ALIGN(pixmp->height, 32);
 
@@ -384,13 +375,6 @@ static int vdec_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	vdec_try_fmt_common(inst, f);
 
-	if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
-		joan_tlog("[gfmt] cap=%ux%u bpl=%u size=%u inst=%ux%u crop=%ux%u\n",
-			  pixmp->width, pixmp->height,
-			  pixmp->plane_fmt[0].bytesperline,
-			  pixmp->plane_fmt[0].sizeimage, inst->width,
-			  inst->height, inst->crop.width, inst->crop.height);
-
 	return 0;
 }
 
@@ -415,15 +399,6 @@ static int vdec_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		return -EBUSY;
 
 	orig_pixmp = *pixmp;
-
-	/*
-	 * 4:2:0 需要偶数宽高，过小尺寸固件无法构成合法帧。
-	 * 必须在 clamp/对齐之前用调用方原始值判断，否则 1920x1 这类
-	 * 会被 clamp 到最小高度后放行，最终产出垃圾码流。
-	 */
-	if ((orig_pixmp.width & 1) || (orig_pixmp.height & 1) ||
-	    orig_pixmp.width < 16 || orig_pixmp.height < 16)
-		return -EINVAL;
 
 	fmt = vdec_try_fmt_common(inst, f);
 
@@ -1054,15 +1029,6 @@ static int vdec_queue_setup(struct vb2_queue *q,
 			    unsigned int *num_buffers, unsigned int *num_planes,
 			    unsigned int sizes[], struct device *alloc_devs[])
 {
-	/*
-	 * 解码侧**不**启用 non_coherent_mem：
-	 * - 解码路径没有 CPU 拷贝，实测 cached/uncached 都是 ~216 fps（1080p）；
-	 * - 它会让 vb2_core_create_bufs() 的 verify_coherency_flags() 失败
-	 *   （应用不传 V4L2_MEMORY_FLAG_NON_COHERENT，而我们置了 1），
-	 *   于是 REQBUFS 之后再 CREATE_BUFS 的应用会拿到 -EINVAL。
-	 * 这个代价只在确实需要缓存映射的编码侧重排上才值得付。
-	 */
-
 	struct venus_inst *inst = vb2_get_drv_priv(q);
 	struct venus_core *core = inst->core;
 	unsigned int in_num, out_num;
@@ -1071,6 +1037,7 @@ static int vdec_queue_setup(struct vb2_queue *q,
 	JOAN_VTRACE("vdec_queue_setup: type=%d count=%u planes=%u state=%d reconfig=%d",
 		    q->type, *num_buffers, *num_planes,
 		    inst->codec_state, inst->reconfig);
+
 	if (*num_planes) {
 		unsigned int output_buf_size = venus_helper_get_opb_size(inst);
 
@@ -1420,18 +1387,6 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	mutex_lock(&inst->lock);
 
-	inst->joan_dec_stopping = false;
-	/*
-	 * 每次重新开始流都要清掉时间戳回退的状态。
-	 * 同一个 fd 上先后解两个文件时，上一路流的 last_ts 会让新流的
-	 * 第一帧被判成"时间戳回退"并被强行加大，时间轴就错了。
-	 */
-	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		inst->joan_dec_last_ts = 0;
-		inst->joan_dec_ts_seen = false;
-		inst->joan_dec_ts_fixups = 0;
-		inst->joan_dec_empty_recycled = 0;
-	}
 	JOAN_VTRACE("vdec_start_streaming: type=%d count=%u", q->type, count);
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		ret = vdec_start_capture(inst);
@@ -1553,7 +1508,6 @@ static void vdec_stop_streaming(struct vb2_queue *q)
 
 	mutex_lock(&inst->lock);
 
-	inst->joan_dec_stopping = true;
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		ret = vdec_stop_capture(inst);
 	else
@@ -1585,11 +1539,6 @@ static void vdec_session_release(struct venus_inst *inst)
 
 	mutex_lock(&inst->lock);
 	inst->codec_state = VENUS_DEC_STATE_DEINIT;
-	inst->joan_dec_stopping = true;
-	if (joan_dec_ts_fallback || joan_dec_clean_stream)
-		JOAN_VTRACE("decoder summary: id=%#x empty_recycled=%u ts_fixups=%u",
-			    inst->id, inst->joan_dec_empty_recycled,
-			    inst->joan_dec_ts_fixups);
 
 	ret = hfi_session_stop(inst);
 	abort = (ret && ret != -EINVAL) ? 1 : 0;
@@ -1680,18 +1629,6 @@ static const struct vb2_ops vdec_vb2_ops = {
 	.buf_queue = vdec_vb2_buf_queue,
 };
 
-
-/*
- * 解码输出布局转换：
- *   固件按 128 对齐步幅、32 行对齐高度写 NV12
- *     Y: ALIGN(w,128) x ALIGN(h,32)，UV 紧随其后；
- *   而用户态（ffmpeg v4l2m2m）按可见尺寸紧凑读写
- *     Y: w x h，UV 紧跟其后，每帧 w*h*3/2 字节。
- * 两者不一致时，ffmpeg 每帧都从错误偏移开始读，画面是纯绿 + 横纹
- * （实测 PSNR ≈ 5 dB）。这里在交还缓冲之前把固件布局搬成紧凑布局。
- * 顺序：先 Y（目标区间 0..w*h 不碰 UV 源），再 UV（逐行 src>dst，从后往前）。
- */
-
 static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 			  u32 tag, u32 bytesused, u32 data_offset, u32 flags,
 			  u32 hfi_flags, u64 timestamp_us)
@@ -1709,7 +1646,7 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
 	vbuf = venus_helper_find_buf(inst, type, tag);
-	if (!joan_trace_quiet && V4L2_TYPE_IS_CAPTURE(type)) {
+	if (V4L2_TYPE_IS_CAPTURE(type)) {
 		struct v4l2_m2m_buffer *b;
 		unsigned int n = 0;
 
@@ -1735,31 +1672,6 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	}
 	if (!vbuf) {
 		venus_helper_change_dpb_owner(inst, vbuf, type, buf_type, tag);
-		return;
-	}
-	if (joan_dec_clean_stream)
-		to_venus_buffer(vbuf)->joan_submitted = false;
-
-	/*
-	 * A flush returns empty CAPTURE buffers; they are not decoded frames.
-	 * Keep them in the driver while transparent reconfiguration is active.
-	 * Reconfiguration submits the held buffers after FLUSH_DONE. For a late
-	 * empty completion, resubmit only that buffer: submitting the whole dst
-	 * queue here would send buffers which are still owned by firmware twice.
-	 */
-	if (joan_dec_clean_stream && joan_dec_transparent_reconfig &&
-	    V4L2_TYPE_IS_CAPTURE(type) && !bytesused &&
-	    !(hfi_flags & HFI_BUFFERFLAG_EOS) && !inst->joan_dec_stopping) {
-		int ret = 0;
-
-		inst->joan_dec_empty_recycled++;
-		v4l2_m2m_buf_queue(inst->m2m_ctx, vbuf);
-		if (!inst->reconfig)
-			ret = venus_helper_process_one_buf(inst, vbuf);
-		if (ret) {
-			venus_helper_find_buf(inst, type, tag);
-			v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
-		}
 		return;
 	}
 
@@ -1829,33 +1741,6 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		state = VB2_BUF_STATE_ERROR;
 		vb2_set_plane_payload(vb, 0, 0);
 		vb->timestamp = 0;
-	}
-
-	/*
-	 * Raw H264 packets without PTS reach V4L2 with timestamp zero. FFmpeg
-	 * copies that zero back to every decoded frame, and the msm8998 encoder
-	 * rejects the next frame with HFI_ERR_SESSION_INVALID_PARAMETER:
-	 * "Venus Encoder: invalid timestamp received!". Repair at CAPTURE so
-	 * FFmpeg also sees progressing PTS before its frame synchronization.
-	 * Keep increasing client timestamps and leave empty EOS untouched.
-	 */
-	if (joan_dec_ts_fallback && V4L2_TYPE_IS_CAPTURE(type) &&
-	    !inst->joan_dec_stopping &&
-	    (!(vbuf->flags & V4L2_BUF_FLAG_LAST) || bytesused)) {
-		u64 original = vb->timestamp;
-		u64 step = div_u64((u64)NSEC_PER_SEC *
-				   inst->timeperframe.numerator,
-				   inst->timeperframe.denominator ?: 30);
-
-		step = max_t(u64, step, NSEC_PER_USEC);
-		if (inst->joan_dec_ts_seen && original <= inst->joan_dec_last_ts) {
-			vb->timestamp = inst->joan_dec_last_ts + step;
-			if (inst->joan_dec_ts_fixups++ < 8)
-				joan_tlog("[dec-ts] id=%#x in=%llu out=%llu step=%llu\n",
-					  inst->id, original, vb->timestamp, step);
-		}
-		inst->joan_dec_last_ts = vb->timestamp;
-		inst->joan_dec_ts_seen = true;
 	}
 
 	v4l2_m2m_buf_done(vbuf, state);
@@ -2209,14 +2094,6 @@ static int vdec_close(struct file *file)
 
 	vdec_pm_get(inst);
 	cancel_work_sync(&inst->delayed_process_work);
-	/*
-	 * joan_reconf_work 会拿 inst->lock 并调用 hfi_session_flush() /
-	 * vdec_reconfigure()。原来 close 只取消了 delayed_process_work，
-	 * 重配工作若还在排队或正在运行，venus_close_common() 释放队列与
-	 * mutex、随后 kfree(inst) 之后它仍会访问 inst —— 典型的 use-after-free。
-	 * 必须在销毁实例之前同步取消。
-	 */
-	cancel_work_sync(&inst->joan_reconf_work);
 	venus_close_common(inst, file);
 	ida_destroy(&inst->dpb_ids);
 	vdec_pm_put(inst, false);

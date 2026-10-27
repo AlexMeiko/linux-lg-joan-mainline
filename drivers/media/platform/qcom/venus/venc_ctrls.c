@@ -7,8 +7,12 @@
 #include <linux/module.h>
 
 unsigned int joan_enc_allow_separate = 1;
+module_param(joan_enc_allow_separate, uint, 0644);
+MODULE_PARM_DESC(joan_enc_allow_separate, "joan: accept HEADER_MODE_SEPARATE");
 
 unsigned int joan_enc_force_joined = 1;
+module_param(joan_enc_force_joined, uint, 0644);
+MODULE_PARM_DESC(joan_enc_force_joined, "joan: force JOINED header mode in firmware");
 
 #ifndef JOAN_VTRACE
 #define JOAN_VTRACE(fmt, ...) do { \
@@ -52,14 +56,6 @@ static int venc_calc_bpframes(u32 gop_size, u32 conseq_b, u32 *bf, u32 *pf)
 	b = p = half;
 
 	for (; b <= gop_size - 1; b++, p--) {
-		/*
-		 * p 递减到 0 时 b % p 是除零。
-		 * 例：GOP=1 → half=0 → 首轮就是 0 % 0；
-		 *     GOP=4、B=2 → 第二轮 p=0。
-		 * 没有可用的 (b,p) 组合时直接退出，由后面的 !found 返回 -EINVAL。
-		 */
-		if (!p)
-			break;
 		if (b % p)
 			continue;
 
@@ -112,7 +108,6 @@ static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 	struct hfi_ltr_use ltr_use;
 	struct hfi_ltr_mark ltr_mark;
 	u32 bframes;
-	u32 num_p;
 	u32 ptype;
 	int ret;
 
@@ -272,13 +267,11 @@ static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 		mutex_unlock(&inst->lock);
 		break;
 	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
-		/* 先算到局部变量，成功后再写回，避免失败时把 num_p_frames 清成 0 */
 		ret = venc_calc_bpframes(ctrl->val, ctr->num_b_frames, &bframes,
-					 &num_p);
+					 &ctr->num_p_frames);
 		if (ret)
 			return ret;
 
-		ctr->num_p_frames = num_p;
 		ctr->gop_size = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:

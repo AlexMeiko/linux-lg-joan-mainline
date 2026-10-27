@@ -8,29 +8,50 @@
 #include <linux/delay.h>
 
 /* 候选 46：编码器高度是否按 32 对齐（默认 0=只对齐到 2）*/
-
-
-static bool joan_enc_nv12_repack = 1;
+unsigned int joan_enc_no_w_align;
+module_param(joan_enc_no_w_align, uint, 0644);
+MODULE_PARM_DESC(joan_enc_no_w_align, "joan: skip 128-pixel width alignment for encoder");
 
 unsigned int joan_enc_repush_props;
+module_param(joan_enc_repush_props, uint, 0644);
+MODULE_PARM_DESC(joan_enc_repush_props, "joan: re-send encoder properties after session start");
 
 unsigned int joan_enc_start_delay_ms;
+module_param(joan_enc_start_delay_ms, uint, 0644);
+MODULE_PARM_DESC(joan_enc_start_delay_ms, "joan: delay encoder session start (ms)");
 
 unsigned int joan_enc_h_align32;
 
 unsigned int joan_enc_resubmit_inputs = 1;
+module_param(joan_enc_resubmit_inputs, uint, 0644);
+MODULE_PARM_DESC(joan_enc_resubmit_inputs, "joan: resubmit held encoder input buffers at streamon");
 
 extern unsigned int joan_enc_cap_before_input;
+extern unsigned int joan_enc_prewarm;
+static u32 joan_warm_id;
+static bool joan_warm_valid;
 extern unsigned int joan_enc_reload_res;
 extern unsigned int joan_enc_recover;
 
 unsigned int joan_enc_release_input = 1;
+module_param(joan_enc_release_input, uint, 0644);
+MODULE_PARM_DESC(joan_enc_release_input, "joan: release held input after capture submitted");
 
 unsigned int joan_enc_hold_caps = 1;
+module_param(joan_enc_hold_caps, uint, 0644);
+MODULE_PARM_DESC(joan_enc_hold_caps, "joan: hold encoder capture buffers queued before streamon");
 
 unsigned int joan_enc_autostart_cap = 1;
+module_param(joan_enc_autostart_cap, uint, 0644);
+MODULE_PARM_DESC(joan_enc_autostart_cap, "joan: start capture side when output queue starts");
 
 unsigned int joan_stat_start, joan_stat_autostart, joan_stat_hold, joan_stat_capsub;
+module_param(joan_stat_start, uint, 0644);
+module_param(joan_stat_autostart, uint, 0644);
+module_param(joan_stat_hold, uint, 0644);
+module_param(joan_stat_capsub, uint, 0644);
+module_param(joan_enc_h_align32, uint, 0644);
+MODULE_PARM_DESC(joan_enc_h_align32, "joan: align encoder height to 32 (0 = align to 2)");
 
 #ifndef JOAN_VTRACE
 #define JOAN_VTRACE(fmt, ...) do { \
@@ -231,14 +252,7 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 
 	/* 候选 153：可选跳过 128 对齐（320 会被扩成 384，导致 app 按 384 步幅
 	 * 填 138240 字节，而固件期望的可见尺寸是 115200） */
-	/*
-	 * 只做偶数对齐，**不**把可见宽度扩到 128 的倍数。
-	 * 扩宽会让 320 宽的输入输出成 384 宽（多出 64 列填充），
-	 * 用户拿到的码流尺寸就变了。硬件要求的 128 步幅由
-	 * venc_buf_prepare() 在 QBUF 时重排完成，sizeimage 也仍按
-	 * ALIGN(width,128) 计算，缓冲足够。
-	 */
-	pixmp->width = ALIGN(pixmp->width, 2);
+	pixmp->width = ALIGN(pixmp->width, joan_enc_no_w_align ? 2 : 128);
 	/*
 	 * 候选 46：原来高度按 32 对齐（240→256）。ffmpeg 的 v4l2m2m 在把 AVFrame
 	 * 拷进 V4L2 缓冲时用 **V4L2 的 height** 计算行数，帧只有 240 行时会越界读，
@@ -300,15 +314,6 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	orig_pixmp = *pixmp;
 
-	/*
-	 * 4:2:0 需要偶数宽高，过小尺寸固件无法构成合法帧。
-	 * 必须在 clamp/对齐之前用调用方原始值判断，否则 1920x1 这类
-	 * 会被 clamp 到最小高度后放行，最终产出垃圾码流。
-	 */
-	if ((orig_pixmp.width & 1) || (orig_pixmp.height & 1) ||
-	    orig_pixmp.width < 16 || orig_pixmp.height < 16)
-		return -EINVAL;
-
 	fmt = venc_try_fmt_common(inst, f);
 	if (!fmt)
 		return -EINVAL;
@@ -333,17 +338,14 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		inst->out_width = format.fmt.pix_mp.width;
 		inst->out_height = format.fmt.pix_mp.height;
 		/*
-		 * 记录「可见尺寸」，用于把固件的 filled_len 截到真实帧大小。
-		 *
-		 * 两点必须注意：
-		 * 1) 不能用对齐后的 out_width —— 我们已不再把可见宽度扩到 128 倍数，
-		 *    format 里的宽高就是可见值（已被 try_fmt_common 夹到 16..4096）。
-		 * 2) 不能只在第一次 S_FMT 记录 —— 同一个 fd 从 320x240 改到 1080p 时
-		 *    旧值会把 filled_len 截成 115200，固件只能拿到小半帧。
-		 * 用 clamp 后的值同时避免了用 orig_pixmp 原值做 u32 乘法溢出。
+		 * 候选 130：这里必须记录「应用请求的可见尺寸」（orig_pixmp），
+		 * 而不是驱动对齐后的 out_width（320x240 会被对齐成 384x240）。
+		 * 固件只接受可见尺寸的填入长度（320x240 NV12 = 115200）。
 		 */
-		inst->joan_vis_w = format.fmt.pix_mp.width;
-		inst->joan_vis_h = format.fmt.pix_mp.height;
+		if (!inst->joan_vis_w) {
+			inst->joan_vis_w = orig_pixmp.width;
+			inst->joan_vis_h = orig_pixmp.height;
+		}
 		inst->colorspace = pixmp->colorspace;
 		inst->ycbcr_enc = pixmp->ycbcr_enc;
 		inst->quantization = pixmp->quantization;
@@ -1199,14 +1201,6 @@ static int venc_queue_setup(struct vb2_queue *q,
 			    unsigned int *num_buffers, unsigned int *num_planes,
 			    unsigned int sizes[], struct device *alloc_devs[])
 {
-	/*
-	 * 默认 vb2_dma_contig 用 dma_alloc_coherent，在 arm64 上是非缓存内存，
-	 * CPU 往缓冲里搬 NV12 只有 ~390MB/s（实测 4K 每帧重排 10.5ms）。
-	 * 改走 non-coherent 路径可拿到缓存映射，vb2 会在 buf_prepare 之后
-	 * 自动 dma_sync_for_device、在 dequeue 前 sync_for_cpu，正确性不变。
-	 */
-	q->non_coherent_mem = true;
-
 	struct venus_inst *inst = vb2_get_drv_priv(q);
 	struct venus_core *core = inst->core;
 	unsigned int num, min = 4;
@@ -1347,20 +1341,9 @@ static void venc_buf_cleanup(struct vb2_buffer *vb)
 	struct venus_buffer *buf = to_venus_buffer(vbuf);
 
 	mutex_lock(&inst->lock);
-	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		if (!list_empty(&inst->registeredbufs))
 			list_del_init(&buf->reg_list);
-		/*
-		 * 缓冲要被销毁了，必须先从"持有"链表摘掉。
-		 * 否则启动失败/REQBUFS(0) 之后链表里会留下指向已释放缓冲的节点，
-		 * 后续遍历就是 use-after-free；残留的 joan_held 还会让重新
-		 * 入队的缓冲被跳过（永远不提交给固件）。
-		 */
-		if (buf->joan_held) {
-			list_del_init(&buf->joan_list);
-			buf->joan_held = false;
-		}
-	}
 	mutex_unlock(&inst->lock);
 
 	inst->buf_count--;
@@ -1675,124 +1658,11 @@ static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 	mutex_unlock(&inst->lock);
 }
 
-static int venc_buf_prepare(struct vb2_buffer *vb)
-{
-	struct venus_inst *inst = vb2_get_drv_priv(vb->vb2_queue);
-	u32 src_stride, dst_stride, y_rows, uv_rows;
-	u32 src_uv, dst_uv, dst_y_size;
-	u32 payload, bufsize;
-	void *data;
-	int ret, r;
-
-	ret = venus_helper_vb2_buf_prepare(vb);
-	if (ret || !joan_enc_nv12_repack ||
-	    vb->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ||
-	    inst->fmt_out->pixfmt != V4L2_PIX_FMT_NV12)
-		return ret;
-
-	payload = vb2_get_plane_payload(vb, 0);
-	bufsize = vb2_plane_size(vb, 0);
-	if (!payload || vb->memory != VB2_MEMORY_MMAP || vb->planes[0].data_offset)
-		return 0;
-
-	/*
-	 * 用户态（ffmpeg v4l2m2m）按**可见尺寸的紧凑布局**填数据：
-	 *   Y: width x height，UV 紧跟其后，载荷 = width*height*3/2。
-	 * 而 Venus 硬件按 128 对齐步幅、32 行对齐高度取图：
-	 *   Y: ALIGN(width,128) x ALIGN(height,32)，UV 起点在 Y 平面之后。
-	 * 两者在 320x240 这类尺寸上差 64 字节/行、16 行，直接喂进去画面会
-	 * 从中间开始错位（实测上 1/3 彩条乱码、下 2/3 纯绿）。
-	 * 这里在 QBUF 之前把紧凑布局重排成硬件布局。
-	 */
-	y_rows = inst->out_height;
-	uv_rows = DIV_ROUND_UP(inst->out_height, 2);
-	/*
-	 * 源步幅不能直接用 inst->out_width —— 那是 S_FMT 之后的对齐值（384）。
-	 * 用户态实际是按**可见宽度**紧凑填充的，所以从载荷反推：
-	 *   payload = src_stride * (y_rows + uv_rows)
-	 */
-	if (!(y_rows + uv_rows))
-		return 0;
-	src_stride = payload / (y_rows + uv_rows);
-	if (src_stride * (y_rows + uv_rows) != payload)
-		return 0;
-	dst_stride = ALIGN(inst->out_width, 128);
-	/* 宽度已经 128 对齐时 src==dst，但 UV 平面仍需按行数对齐搬迁，
-	 * 不能在这里直接返回（否则 720p/1080p 的色度会错位成重影）。 */
-	if (dst_stride < src_stride)
-		return 0;
-	src_uv = src_stride * y_rows;
-	dst_y_size = dst_stride * ALIGN(y_rows, 32);
-	dst_uv = dst_y_size;
-
-	/* 已经是硬件布局（载荷覆盖到 UV 末尾）就不动 */
-	if (payload >= dst_uv + dst_stride * ALIGN(uv_rows, 16))
-		return 0;
-	/*
-	 * 只认两种布局：已经是硬件布局（上面已跳过），或者用户态紧凑布局。
-	 * 其它情况说明用户态写的尺寸和我们理解的不一致，继续下去只会
-	 * 产出花屏 —— 直接报错比静默输出坏画面好。
-	 */
-	if (payload < src_uv + src_stride * uv_rows) {
-		dev_warn(inst->core->dev, "joan: 无法识别的 NV12 载荷 %u（期望 %u）\n",
-			 payload, src_uv + src_stride * uv_rows);
-		return -EINVAL;
-	}
-	if (dst_uv + dst_stride * ALIGN(uv_rows, 16) > bufsize)
-		return 0;
-
-	data = vb2_plane_vaddr(vb, 0);
-	if (!data)
-		return -EFAULT;
-
-
-	/*
-	 * 顺序很关键：必须先搬 UV，再搬 Y。
-	 * Y 的目标区间（0 .. dst_uv）会覆盖 UV 的源区间（src_uv ..），
-	 * 先搬 Y 会把还没搬走的 UV 数据踩掉 —— 实测表现为整幅横向彩条。
-	 * 两次都从后往前，避免同一平面内自我覆盖。
-	 */
-	if (src_uv != dst_uv || src_stride != dst_stride) {
-		if (src_stride == dst_stride)
-			/* 步幅相同（128 对齐宽度）时整块搬，省掉每行的调用开销 */
-			memmove(data + dst_uv, data + src_uv,
-				(u32)uv_rows * dst_stride);
-		else
-			for (r = (int)uv_rows - 1; r >= 0; r--)
-				memmove(data + dst_uv + (u32)r * dst_stride,
-					data + src_uv + (u32)r * src_stride,
-					src_stride);
-	}
-	if (src_stride != dst_stride) {
-		for (r = (int)y_rows - 1; r >= 0; r--)
-			memmove(data + (u32)r * dst_stride,
-				data + (u32)r * src_stride, src_stride);
-	}
-	/* Y 尾部空洞与 UV 末行补齐填中性色度 */
-	if (dst_y_size > dst_stride * y_rows)
-		memset(data + dst_stride * y_rows, 16,
-		       dst_y_size - dst_stride * y_rows);
-	if (dst_stride * ALIGN(uv_rows, 16) > dst_stride * uv_rows)
-		memset(data + dst_uv + dst_stride * uv_rows, 16,
-		       dst_stride * (ALIGN(uv_rows, 16) - uv_rows));
-	dma_wmb();
-
-	/*
-	 * 重排是原地改内容、不幂等：用户态 DQBUF 后不重写内容就再次 QBUF 时，
-	 * 会把已转换好的数据再搬一次（4K 实测 414 万个字节被破坏）。
-	 * 把 payload 改成硬件布局的完整大小，再次 QBUF 就会命中上面
-	 * "已经是硬件布局"的判断直接跳过；用户态若重新写入紧凑帧并恢复
-	 * payload，仍会正常重排。
-	 */
-	vb2_set_plane_payload(vb, 0, dst_uv + dst_stride * ALIGN(uv_rows, 16));
-	return 0;
-}
-
 static const struct vb2_ops venc_vb2_ops = {
 	.queue_setup = venc_queue_setup,
 	.buf_init = venc_buf_init,
 	.buf_cleanup = venc_buf_cleanup,
-	.buf_prepare = venc_buf_prepare,
+	.buf_prepare = venus_helper_vb2_buf_prepare,
 	.start_streaming = venc_start_streaming,
 	.stop_streaming = venus_helper_vb2_stop_streaming,
 	.buf_queue = venc_vb2_buf_queue,
@@ -1940,6 +1810,20 @@ static int venc_open(struct file *file)
 	INIT_LIST_HEAD(&inst->joan_held_caps);
 	INIT_DELAYED_WORK(&inst->joan_in_work, joan_in_work_fn);
 	INIT_WORK(&inst->joan_rec_work, joan_rec_work_fn);
+	inst->joan_owns_warm = false;
+	if (joan_enc_prewarm) {
+		if (joan_warm_valid) {
+			inst->id = joan_warm_id;
+			joan_warm_valid = false;
+			joan_tlog("[warm] 接管预热会话 id=%#x\n", inst->id);
+		} else {
+			venus_helper_init_instance(inst);
+			joan_warm_id = inst->id;
+			joan_warm_valid = true;
+			inst->joan_owns_warm = true;
+			joan_tlog("[warm] 新建预热会话 id=%#x\n", inst->id);
+		}
+	}
 	mutex_init(&inst->lock);
 	mutex_init(&inst->ctx_q_lock);
 

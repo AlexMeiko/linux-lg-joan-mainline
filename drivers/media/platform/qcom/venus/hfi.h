@@ -154,8 +154,6 @@ int hfi_core_trigger_ssr(struct venus_core *core, u32 type);
 int hfi_session_create(struct venus_inst *inst, const struct hfi_inst_ops *ops);
 void hfi_session_destroy(struct venus_inst *inst);
 int hfi_session_init(struct venus_inst *inst, u32 pixfmt);
-int hfi_joan_prewarm_encoder(struct venus_core *core);
-void hfi_joan_drop_warm_encoder(struct venus_core *core);
 int hfi_session_deinit(struct venus_inst *inst);
 int hfi_session_start(struct venus_inst *inst);
 int hfi_session_stop(struct venus_inst *inst);

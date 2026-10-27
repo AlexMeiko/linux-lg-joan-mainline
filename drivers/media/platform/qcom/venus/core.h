@@ -220,8 +220,6 @@ struct venus_core {
 	struct mutex lock;
 	struct mutex joan_seq_lock;
 	struct mutex joan_cfg_lock;
-	struct mutex joan_warm_lock;
-	struct venus_inst *joan_warm_enc;
 	struct list_head instances;
 	atomic_t insts_count;
 	unsigned int state;
@@ -463,11 +461,7 @@ struct venus_inst {
 	struct list_head joan_held_caps;
 	bool joan_enc_running;
 	bool joan_cap_ready;
-	u64 joan_dec_last_ts;
-	u32 joan_dec_ts_fixups;
-	bool joan_dec_ts_seen;
-	bool joan_dec_stopping;
-	u32 joan_dec_empty_recycled;
+	u32 joan_fb_n;
 	u32 id;
 	bool joan_owns_warm;
 	struct work_struct joan_rec_work;
