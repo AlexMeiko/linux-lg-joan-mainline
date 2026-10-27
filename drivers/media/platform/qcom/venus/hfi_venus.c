@@ -387,9 +387,7 @@ static void venus_free(struct venus_hfi_device *hdev, struct mem_desc *mem)
  * 既有实验中 VBIF 访问曾触发复位，亦曾全零返回；可访问性随阶段变化。
  * 精确放行已有 0xe2010=0 初始化，不据单点读数外推整个窗口。
  */
-static bool joan_skip_presets;
-module_param(joan_skip_presets, bool, 0644);
-MODULE_PARM_DESC(joan_skip_presets, "joan: skip presets except msm8998 CPU_CGC_DIS=0");
+static bool joan_skip_presets = 1;
 
 /*
  * joan_vbif_write=1 —— 是否真的去碰 VBIF 寄存器窗（base+0x80000 起）。
@@ -404,8 +402,6 @@ MODULE_PARM_DESC(joan_skip_presets, "joan: skip presets except msm8998 CPU_CGC_D
  * 本候选同时移除隐式 post-run VBIF 诊断，仍须真机验证是否稳定。
  */
 static bool joan_vbif_write;
-module_param(joan_vbif_write, bool, 0644);
-MODULE_PARM_DESC(joan_vbif_write, "joan: enable historical VBIF force-on/halt accesses, default 0");
 
 /*
  * joan_boot_state —— 只读采样「ARM9 到底有没有被放出来 / 有没有在跑」。
@@ -423,8 +419,6 @@ MODULE_PARM_DESC(joan_vbif_write, "joan: enable historical VBIF force-on/halt ac
  * 一律不碰。本函数只有 readl，没有 writel。
  */
 static unsigned int joan_boot_state;
-module_param(joan_boot_state, uint, 0644);
-MODULE_PARM_DESC(joan_boot_state, "joan: read-only boot state sample (1=A stage, 2=A+B)");
 
 /*
  * joan_sfr_clear —— 第十八候选取证开关（默认 1）。
@@ -435,8 +429,6 @@ MODULE_PARM_DESC(joan_boot_state, "joan: read-only boot state sample (1=A stage,
  * 纯主机内存写，不触碰任何 MMIO 寄存器。
  */
 static unsigned int joan_sfr_clear = 1;
-module_param(joan_sfr_clear, uint, 0644);
-MODULE_PARM_DESC(joan_sfr_clear, "joan: zero the SFR buffer at every power-on (default 1)");
 
 /*
  * joan_clock_config —— 每次上电都写 WRAPPER_CLOCK_CONFIG(0xe0004)=0。
@@ -445,9 +437,7 @@ MODULE_PARM_DESC(joan_sfr_clear, "joan: zero the SFR buffer at every power-on (d
  * 第十七候选只在 venus_boot()（probe 一次）里写，导致第二次/第三次 runtime resume
  * 后门控重新生效、ARM9 不再响应握手（实测 count=100 / -110）。
  */
-unsigned int joan_clock_config;
-module_param(joan_clock_config, uint, 0644);
-MODULE_PARM_DESC(joan_clock_config, "joan: write WRAPPER_CLOCK_CONFIG(0xe0004)=0 on every power-on");
+unsigned int joan_clock_config = 1;
 
 static void venus_set_registers(struct venus_hfi_device *hdev)
 {

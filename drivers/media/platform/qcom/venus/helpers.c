@@ -29,29 +29,18 @@
 
 /* 候选 27：解码输入 flags 开关（bit0=CODECCONFIG, bit1=ENDOFFRAME），默认 0 */
 unsigned int joan_enc_prewarm;
-module_param(joan_enc_prewarm, uint, 0444);
-MODULE_PARM_DESC(joan_enc_prewarm, "joan: reserve H264 encoder before decoder init (requires joan_no_rpm=1)");
 EXPORT_SYMBOL_GPL(joan_enc_prewarm);
 
-bool joan_dec_clean_stream = true;
-module_param(joan_dec_clean_stream, bool, 0644);
-MODULE_PARM_DESC(joan_dec_clean_stream,
-		"joan: track decoder submissions and recycle empty reconfiguration buffers");
+bool joan_dec_clean_stream = 1;
 EXPORT_SYMBOL_GPL(joan_dec_clean_stream);
 
 unsigned int joan_enc_recover;
-module_param(joan_enc_recover, uint, 0644);
-MODULE_PARM_DESC(joan_enc_recover, "joan: rebuild encoder session on first 0x1002");
 EXPORT_SYMBOL_GPL(joan_enc_recover);
 
 unsigned int joan_enc_cap_before_input;
-module_param(joan_enc_cap_before_input, uint, 0644);
-MODULE_PARM_DESC(joan_enc_cap_before_input, "joan: submit capture buffers before releasing input");
 EXPORT_SYMBOL_GPL(joan_enc_cap_before_input);
 
 unsigned int joan_enc_clamp_fill = 1;
-module_param(joan_enc_clamp_fill, uint, 0644);
-MODULE_PARM_DESC(joan_enc_clamp_fill, "joan: clamp encoder input filled_len to visible size");
 
 /* 候选 136：驱动侧 trace 环，避免被 dmesg 环形缓冲冲掉 */
 char joan_trace_ring[32768];
@@ -96,14 +85,10 @@ void joan_tlog(const char *fmt, ...)
 }
 EXPORT_SYMBOL_GPL(joan_tlog);
 
-unsigned int joan_trace_quiet;
-module_param(joan_trace_quiet, uint, 0644);
-MODULE_PARM_DESC(joan_trace_quiet, "joan: suppress per-buffer/hfi trace lines");
+unsigned int joan_trace_quiet = 1;
 EXPORT_SYMBOL_GPL(joan_trace_quiet);
 
 unsigned int joan_in_flags;
-module_param(joan_in_flags, uint, 0644);
-MODULE_PARM_DESC(joan_in_flags, "joan: decoder input flags (1=CODECCONFIG, 2=ENDOFFRAME)");
 #include "hfi_parser.h"
 
 #define NUM_MBS_720P	(((ALIGN(1280, 16)) >> 4) * ((ALIGN(736, 16)) >> 4))

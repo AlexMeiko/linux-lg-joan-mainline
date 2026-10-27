@@ -7,12 +7,8 @@
 #include <linux/module.h>
 
 unsigned int joan_enc_allow_separate = 1;
-module_param(joan_enc_allow_separate, uint, 0644);
-MODULE_PARM_DESC(joan_enc_allow_separate, "joan: accept HEADER_MODE_SEPARATE");
 
 unsigned int joan_enc_force_joined = 1;
-module_param(joan_enc_force_joined, uint, 0644);
-MODULE_PARM_DESC(joan_enc_force_joined, "joan: force JOINED header mode in firmware");
 
 #ifndef JOAN_VTRACE
 #define JOAN_VTRACE(fmt, ...) do { \

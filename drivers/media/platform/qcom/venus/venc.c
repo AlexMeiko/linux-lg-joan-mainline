@@ -9,55 +9,30 @@
 
 /* 候选 46：编码器高度是否按 32 对齐（默认 0=只对齐到 2）*/
 unsigned int joan_enc_no_w_align;
-module_param(joan_enc_no_w_align, uint, 0644);
-MODULE_PARM_DESC(joan_enc_no_w_align, "joan: skip 128-pixel width alignment for encoder");
 
 static bool joan_enc_uv_align32 = true;
-module_param(joan_enc_uv_align32, bool, 0644);
-MODULE_PARM_DESC(joan_enc_uv_align32, "joan: encoder UV plane starts after ALIGN(height,32) rows");
 
-static bool joan_enc_nv12_repack = true;
-module_param(joan_enc_nv12_repack, bool, 0644);
-MODULE_PARM_DESC(joan_enc_nv12_repack,
-		"joan: repack MMAP NV12 chroma to Venus scanline alignment");
+static bool joan_enc_nv12_repack = 1;
 
 unsigned int joan_enc_repush_props;
-module_param(joan_enc_repush_props, uint, 0644);
-MODULE_PARM_DESC(joan_enc_repush_props, "joan: re-send encoder properties after session start");
 
 unsigned int joan_enc_start_delay_ms;
-module_param(joan_enc_start_delay_ms, uint, 0644);
-MODULE_PARM_DESC(joan_enc_start_delay_ms, "joan: delay encoder session start (ms)");
 
 unsigned int joan_enc_h_align32;
 
 unsigned int joan_enc_resubmit_inputs = 1;
-module_param(joan_enc_resubmit_inputs, uint, 0644);
-MODULE_PARM_DESC(joan_enc_resubmit_inputs, "joan: resubmit held encoder input buffers at streamon");
 
 extern unsigned int joan_enc_cap_before_input;
 extern unsigned int joan_enc_reload_res;
 extern unsigned int joan_enc_recover;
 
 unsigned int joan_enc_release_input = 1;
-module_param(joan_enc_release_input, uint, 0644);
-MODULE_PARM_DESC(joan_enc_release_input, "joan: release held input after capture submitted");
 
 unsigned int joan_enc_hold_caps = 1;
-module_param(joan_enc_hold_caps, uint, 0644);
-MODULE_PARM_DESC(joan_enc_hold_caps, "joan: hold encoder capture buffers queued before streamon");
 
 unsigned int joan_enc_autostart_cap = 1;
-module_param(joan_enc_autostart_cap, uint, 0644);
-MODULE_PARM_DESC(joan_enc_autostart_cap, "joan: start capture side when output queue starts");
 
 unsigned int joan_stat_start, joan_stat_autostart, joan_stat_hold, joan_stat_capsub;
-module_param(joan_stat_start, uint, 0644);
-module_param(joan_stat_autostart, uint, 0644);
-module_param(joan_stat_hold, uint, 0644);
-module_param(joan_stat_capsub, uint, 0644);
-module_param(joan_enc_h_align32, uint, 0644);
-MODULE_PARM_DESC(joan_enc_h_align32, "joan: align encoder height to 32 (0 = align to 2)");
 
 #ifndef JOAN_VTRACE
 #define JOAN_VTRACE(fmt, ...) do { \
@@ -258,7 +233,14 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 
 	/* 候选 153：可选跳过 128 对齐（320 会被扩成 384，导致 app 按 384 步幅
 	 * 填 138240 字节，而固件期望的可见尺寸是 115200） */
-	pixmp->width = ALIGN(pixmp->width, joan_enc_no_w_align ? 2 : 128);
+	/*
+	 * 只做偶数对齐，**不**把可见宽度扩到 128 的倍数。
+	 * 扩宽会让 320 宽的输入输出成 384 宽（多出 64 列填充），
+	 * 用户拿到的码流尺寸就变了。硬件要求的 128 步幅由
+	 * venc_buf_prepare() 在 QBUF 时重排完成，sizeimage 也仍按
+	 * ALIGN(width,128) 计算，缓冲足够。
+	 */
+	pixmp->width = ALIGN(pixmp->width, 2);
 	/*
 	 * 候选 46：原来高度按 32 对齐（240→256）。ffmpeg 的 v4l2m2m 在把 AVFrame
 	 * 拷进 V4L2 缓冲时用 **V4L2 的 height** 计算行数，帧只有 240 行时会越界读，

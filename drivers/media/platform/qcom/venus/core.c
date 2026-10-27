@@ -14,14 +14,10 @@
 #include <linux/module.h>
 
 /* 候选 50：禁止运行时挂起（临时稳定化开关）*/
-unsigned int joan_no_rpm;
-module_param(joan_no_rpm, uint, 0644);
-MODULE_PARM_DESC(joan_no_rpm, "joan: forbid venus runtime suspend (0=normal, 1=always on)");
+unsigned int joan_no_rpm = 1;
 
 /* 候选 36b：收到 HFI 系统错误后不做恢复（避免实验时把内核卡死） */
 unsigned int joan_no_recover;
-module_param(joan_no_recover, uint, 0644);
-MODULE_PARM_DESC(joan_no_recover, "joan: skip venus sys-error recovery (debug only)");
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
@@ -550,12 +546,8 @@ int joan_venus_hwversion_probe(struct venus_core *core, const char *tag)
  * 每条标记独立打印，便于按最后一条 before 定位未返回的读取。
  */
 static char *joan_probe_list;
-module_param(joan_probe_list, charp, 0644);
-MODULE_PARM_DESC(joan_probe_list, "joan: comma-separated hex offsets to read inside venus reg block");
 
 static bool joan_probe_write;
-module_param(joan_probe_write, bool, 0644);
-MODULE_PARM_DESC(joan_probe_write, "joan: also write bit0 back after reading");
 
 /*
  * joan_probe_poke="0x80004=0x1" —— 逗号分隔的 off=val（都按 16 进制），
@@ -565,21 +557,15 @@ MODULE_PARM_DESC(joan_probe_write, "joan: also write bit0 back after reading");
  *   reg = readl_relaxed(reg_base + VIDC_VENUS_VBIF_CLK_ON);  reg |= FORCE_ON;
  */
 static char *joan_probe_poke;
-module_param(joan_probe_poke, charp, 0644);
-MODULE_PARM_DESC(joan_probe_poke, "joan: comma-separated off=val hex pairs, written (no readback) before scan");
 
 /*
  * joan_vbif_forceon=1 —— A/B 开关：probe 里 pm_runtime_get_sync 之后是否立刻
  * 对 VBIF_CLK_ON 写 FORCE_ON。默认关（见调用点注释）。
  */
 static bool joan_vbif_forceon;
-module_param(joan_vbif_forceon, bool, 0644);
-MODULE_PARM_DESC(joan_vbif_forceon, "joan: force VBIF_CLK_ON at probe (A point), default 0");
 
 /* 1：仅上电和 HW_VERSION；2：PAS 后退出；0：继续原有 probe。 */
 static unsigned int joan_probe_stop;
-module_param(joan_probe_stop, uint, 0444);
-MODULE_PARM_DESC(joan_probe_stop, "joan: stop at runtime PM (1) or after PAS (2), default 0");
 
 /*
  * joan_noc_clks=1 —— H9 实验：下游 msm8998 vidc 每个上电周期要开 12 个时钟，
@@ -591,8 +577,6 @@ MODULE_PARM_DESC(joan_probe_stop, "joan: stop at runtime PM (1) or after PAS (2)
  * 目的是用最小改动做单变量验证。
  */
 static bool joan_noc_clks;
-module_param(joan_noc_clks, bool, 0644);
-MODULE_PARM_DESC(joan_noc_clks, "joan: enable the extra MMSS NoC/SMMU clocks mainline venus lacks");
 
 static const char * const joan_noc_clk_names[] = {
 	"gcc_mmss_sys_noc_axi_clk",

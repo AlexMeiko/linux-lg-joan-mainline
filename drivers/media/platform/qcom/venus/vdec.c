@@ -15,43 +15,26 @@
 
 /* 候选 76：reconfig 期间是否丢弃空的捕获完成（默认 0=正常完成）*/
 unsigned int joan_dec_drop_empty;
-module_param(joan_dec_drop_empty, uint, 0644);
-MODULE_PARM_DESC(joan_dec_drop_empty, "joan: drop empty capture completions during reconfig");
 
 /* 候选 70：是否在 SOURCE_CHANGE 之前就登记捕获缓冲（默认 1，解码需要）*/
 unsigned int joan_dec_early_cap_reg = 1;
-module_param(joan_dec_early_cap_reg, uint, 0644);
-MODULE_PARM_DESC(joan_dec_early_cap_reg, "joan: register capture buffers before source change");
 
 /* 候选 62：解码器收到序列变化后由驱动内部完成重配（对用户态透明）*/
 extern unsigned int joan_trace_quiet;
 unsigned int joan_dec_repack;
-module_param(joan_dec_repack, uint, 0644);
-MODULE_PARM_DESC(joan_dec_repack, "joan: repack decoder capture to compact NV12 layout");
 
-unsigned int joan_dec_transparent_reconfig;
-module_param(joan_dec_transparent_reconfig, uint, 0644);
-MODULE_PARM_DESC(joan_dec_transparent_reconfig, "joan: handle decoder source change inside driver");
+unsigned int joan_dec_transparent_reconfig = 1;
 
-static bool joan_dec_ts_fallback = true;
-module_param(joan_dec_ts_fallback, bool, 0644);
-MODULE_PARM_DESC(joan_dec_ts_fallback,
-		"joan: replace repeated capture timestamps at the negotiated frame rate");
+static bool joan_dec_ts_fallback = 1;
 
 /* 候选 51：解码 G_FMT 在 INIT 状态是否放行（默认 0，保持原语义）*/
-unsigned int joan_dec_gfmt_noblock;
-module_param(joan_dec_gfmt_noblock, uint, 0644);
-MODULE_PARM_DESC(joan_dec_gfmt_noblock, "joan: allow decoder G_FMT before SOURCE_CHANGE");
+unsigned int joan_dec_gfmt_noblock = 1;
 #include <linux/of.h>
 /* 候选 28：固件不发 SOURCE_CHANGE 时，强制走 reconfigure（分配 DPB + SESSION_CONTINUE）*/
 unsigned int joan_dec_force_reconfig;
-module_param(joan_dec_force_reconfig, uint, 0644);
-MODULE_PARM_DESC(joan_dec_force_reconfig, "joan: force decoder reconfigure path on capture start");
 
 /* 候选 33b：early reconfigure 跳过位（bit0=跳过 output_conf/set_num_bufs, bit1=跳过 DPB, bit2=跳过 CONTINUE）*/
 unsigned int joan_early_skip;
-module_param(joan_early_skip, uint, 0644);
-MODULE_PARM_DESC(joan_early_skip, "joan: skip steps in early reconfigure (1=conf 2=dpb 4=continue)");
 
 #include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
