@@ -19,6 +19,7 @@
 #include "hfi.h"
 #include "hfi_helper.h"
 #include "hfi_msgs.h"
+#include "helpers.h"
 #include "hfi_parser.h"
 
 #define SMEM_IMG_VER_TBL	469
@@ -54,7 +55,6 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 		inst->ops->event_notify(inst, EVT_SYS_EVENT_CHANGE, &event);
 		return;
 	}
-
 	event.event_type = pkt->event_data1;
 
 	num_properties_changed = pkt->event_data2;
@@ -71,7 +71,6 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 
 		data_ptr += sizeof(u32);
 		rem_bytes -= sizeof(u32);
-
 		switch (ptype) {
 		case HFI_PROPERTY_PARAM_FRAME_SIZE:
 			if (rem_bytes < sizeof(struct hfi_framesize))
@@ -241,6 +240,18 @@ static void hfi_event_notify(struct venus_core *core, struct venus_inst *inst,
 
 	JOAN_VTRACE("event_notify: id=%#x data1=%#x data2=%#x",
 		    pkt->event_id, pkt->event_data1, pkt->event_data2);
+
+	/*
+	 * 上面的分发表对 EVENT_NOTIFY 在 instance 无效时是放行的
+	 * （SYS_ERROR 本来就没有会话）。但 SESSION_ERROR /
+	 * SESSION_SEQUENCE_CHANGED / RELEASE_BUFFER_REFERENCE 都是会话级事件，
+	 * 处理器会解引用 inst —— 传 NULL 就是空指针解引用。
+	 */
+	if (!inst && pkt->event_id != HFI_EVENT_SYS_ERROR) {
+		dev_warn(core->dev, "joan: 会话级事件 %#x 但 instance 无效，丢弃\n",
+			 pkt->event_id);
+		return;
+	}
 
 	switch (pkt->event_id) {
 	case HFI_EVENT_SYS_ERROR:
@@ -530,6 +541,7 @@ static void hfi_session_load_res_done(struct venus_core *core,
 	struct hfi_msg_session_load_resources_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	joan_tlog("[load_res] err=%u\n", pkt->error_type);
 	complete(&inst->done);
 }
 
@@ -550,6 +562,13 @@ static void hfi_session_etb_done(struct venus_core *core,
 	struct hfi_msg_session_empty_buffer_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	if (joan_enc_recover && pkt->error_type == 0x1002 &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    !inst->joan_recovered) {
+		inst->joan_recovered = true;
+		schedule_work(&inst->joan_rec_work);
+		joan_tlog("[rec] 首个 0x1002，安排会话重建\n");
+	}
 	JOAN_VTRACE("etb_done: sess=%u tag=%u filled=%u err=%u",
 		    inst->session_type, pkt->input_tag, pkt->filled_len,
 		    pkt->error_type);
@@ -655,6 +674,7 @@ static void hfi_session_start_done(struct venus_core *core,
 	struct hfi_msg_session_start_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	joan_tlog("[start] err=%u\n", pkt->error_type);
 	complete(&inst->done);
 }
 
@@ -664,6 +684,7 @@ static void hfi_session_stop_done(struct venus_core *core,
 	struct hfi_msg_session_stop_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	joan_tlog("[stop] err=%u\n", pkt->error_type);
 	complete(&inst->done);
 }
 
@@ -821,7 +842,7 @@ static struct venus_inst *to_instance(struct venus_core *core, u32 session_id)
 
 	mutex_lock(&core->lock);
 	list_for_each_entry(inst, &core->instances, list)
-		if (hash32_ptr(inst) == session_id) {
+		if (inst->id == session_id) {
 			mutex_unlock(&core->lock);
 			return inst;
 		}
