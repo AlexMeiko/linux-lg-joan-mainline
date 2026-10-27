@@ -1055,12 +1055,13 @@ static int vdec_queue_setup(struct vb2_queue *q,
 			    unsigned int sizes[], struct device *alloc_devs[])
 {
 	/*
-	 * 默认 vb2_dma_contig 用 dma_alloc_coherent，在 arm64 上是非缓存内存，
-	 * CPU 往缓冲里搬 NV12 只有 ~390MB/s（实测 4K 每帧重排 10.5ms）。
-	 * 改走 non-coherent 路径可拿到缓存映射，vb2 会在 buf_prepare 之后
-	 * 自动 dma_sync_for_device、在 dequeue 前 sync_for_cpu，正确性不变。
+	 * 解码侧**不**启用 non_coherent_mem：
+	 * - 解码路径没有 CPU 拷贝，实测 cached/uncached 都是 ~216 fps（1080p）；
+	 * - 它会让 vb2_core_create_bufs() 的 verify_coherency_flags() 失败
+	 *   （应用不传 V4L2_MEMORY_FLAG_NON_COHERENT，而我们置了 1），
+	 *   于是 REQBUFS 之后再 CREATE_BUFS 的应用会拿到 -EINVAL。
+	 * 这个代价只在确实需要缓存映射的编码侧重排上才值得付。
 	 */
-	q->non_coherent_mem = true;
 
 	struct venus_inst *inst = vb2_get_drv_priv(q);
 	struct venus_core *core = inst->core;
@@ -1425,12 +1426,15 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * 同一个 fd 上先后解两个文件时，上一路流的 last_ts 会让新流的
 	 * 第一帧被判成"时间戳回退"并被强行加大，时间轴就错了。
 	 */
-	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		inst->joan_dec_last_ts = 0;
-		inst->joan_dec_ts_seen = false;
-		inst->joan_dec_ts_fixups = 0;
-		inst->joan_dec_empty_recycled = 0;
-	}
+	/*
+	 * 任意一个队列重新启动都要清掉时间戳回退状态。
+	 * 只解绑输出队列（seek/换流）时捕获队列不会重新 streamon，
+	 * 若把重置放在 CAPTURE 分支里，旧时间戳会残留。
+	 */
+	inst->joan_dec_last_ts = 0;
+	inst->joan_dec_ts_seen = false;
+	inst->joan_dec_ts_fixups = 0;
+	inst->joan_dec_empty_recycled = 0;
 	JOAN_VTRACE("vdec_start_streaming: type=%d count=%u", q->type, count);
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		ret = vdec_start_capture(inst);

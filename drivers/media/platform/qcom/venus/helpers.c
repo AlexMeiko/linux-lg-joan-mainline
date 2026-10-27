@@ -48,18 +48,6 @@ static DEFINE_SPINLOCK(joan_trace_lock);
 unsigned int joan_trace_ring_pos;
 module_param_string(joan_trace_ring, joan_trace_ring, sizeof(joan_trace_ring), 0444);
 
-void joan_seq_lock(struct venus_inst *inst)
-{
-	mutex_lock(&inst->core->joan_seq_lock);
-}
-EXPORT_SYMBOL_GPL(joan_seq_lock);
-
-void joan_seq_unlock(struct venus_inst *inst)
-{
-	mutex_unlock(&inst->core->joan_seq_lock);
-}
-EXPORT_SYMBOL_GPL(joan_seq_unlock);
-
 void joan_tlog(const char *fmt, ...)
 {
 	char tmp[192];
@@ -678,18 +666,6 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 		fdata.offset = 0;
 	}
 
-
-	{
-		if (inst->session_type == VIDC_SESSION_TYPE_ENC &&
-		    inst->joan_fb_n < 6) {
-			inst->joan_fb_n++;
-			joan_tlog("[fb%u] bt=%u addr=%pad alloc=%u filled=%u off=%u fl=%#x ts=%llu cl=%u\n",
-				  inst->joan_fb_n, fdata.buffer_type,
-				  &fdata.device_addr, fdata.alloc_len,
-				  fdata.filled_len, fdata.offset, fdata.flags,
-				  fdata.timestamp, fdata.clnt_data);
-		}
-	}
 
 	if (joan_dec_clean_stream && inst->session_type == VIDC_SESSION_TYPE_DEC)
 		buf->joan_submitted = true;
