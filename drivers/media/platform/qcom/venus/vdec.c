@@ -236,11 +236,27 @@ vdec_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 			return NULL;
 	}
 
-	pixmp->width = clamp(pixmp->width, frame_width_min(inst),
-			     frame_width_max(inst));
-	pixmp->height = clamp(pixmp->height, frame_height_min(inst),
-			      frame_height_max(inst));
+	/*
+	 * HEVC 的固件能力表里只有 BITRATE 项，没有 FRAME_WIDTH/HEIGHT，
+	 * 于是 frame_width_max() 返回 0，clamp(w, 0, 0) 会把宽高清零，
+	 * 固件拿到 0x0 的格式自然解不出东西（实测只消费 5 字节就停滞）。
+	 * 缺能力项时退回合理范围。
+	 */
+	{
+		u32 wmin = frame_width_min(inst), wmax = frame_width_max(inst);
+		u32 hmin = frame_height_min(inst), hmax = frame_height_max(inst);
 
+		if (!wmax) {
+			wmin = 16;
+			wmax = 4096;
+		}
+		if (!hmax) {
+			hmin = 16;
+			hmax = 4096;
+		}
+		pixmp->width = clamp(pixmp->width, wmin, wmax);
+		pixmp->height = clamp(pixmp->height, hmin, hmax);
+	}
 	if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		pixmp->height = ALIGN(pixmp->height, 32);
 
@@ -1047,7 +1063,6 @@ static int vdec_queue_setup(struct vb2_queue *q,
 	JOAN_VTRACE("vdec_queue_setup: type=%d count=%u planes=%u state=%d reconfig=%d",
 		    q->type, *num_buffers, *num_planes,
 		    inst->codec_state, inst->reconfig);
-
 	if (*num_planes) {
 		unsigned int output_buf_size = venus_helper_get_opb_size(inst);
 

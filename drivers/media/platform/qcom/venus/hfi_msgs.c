@@ -55,7 +55,6 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 		inst->ops->event_notify(inst, EVT_SYS_EVENT_CHANGE, &event);
 		return;
 	}
-
 	event.event_type = pkt->event_data1;
 
 	num_properties_changed = pkt->event_data2;
@@ -72,7 +71,6 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 
 		data_ptr += sizeof(u32);
 		rem_bytes -= sizeof(u32);
-
 		switch (ptype) {
 		case HFI_PROPERTY_PARAM_FRAME_SIZE:
 			if (rem_bytes < sizeof(struct hfi_framesize))
