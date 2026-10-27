@@ -1745,7 +1745,14 @@ static void joan_reconf_work_fn(struct work_struct *work)
 	if (!r) {
 		r = vdec_reconfigure(inst);
 		if (!r) {
-			JOAN_VTRACE("joan_reconf: 重配完成 flush=0 conf=0");
+			/*
+			 * 候选 128：重配后把还在 m2m 源队列里的输入缓冲补提交一次，
+			 * 否则解码在这次 SOURCE_CHANGE 之后就停住（转码时表现为
+			 * 解码会话报 capture 错误、一帧都出不来）。
+			 */
+			int r2 = venus_helper_process_initial_out_bufs(inst);
+
+			JOAN_VTRACE("joan_reconf: 重配完成 补提交输入=%d", r2);
 		} else {
 			JOAN_VTRACE("joan_reconf: vdec_reconfigure=%d", r);
 		}

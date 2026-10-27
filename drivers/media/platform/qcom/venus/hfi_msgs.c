@@ -550,6 +550,9 @@ static void hfi_session_etb_done(struct venus_core *core,
 	struct hfi_msg_session_empty_buffer_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	JOAN_VTRACE("etb_done: sess=%u tag=%u filled=%u err=%u",
+		    inst->session_type, pkt->input_tag, pkt->filled_len,
+		    pkt->error_type);
 	inst->ops->buf_done(inst, HFI_BUFFER_INPUT, pkt->input_tag,
 			    pkt->filled_len, pkt->offset, 0, 0, 0);
 }

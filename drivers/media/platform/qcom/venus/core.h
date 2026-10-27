@@ -334,6 +334,8 @@ struct venus_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 	bool joan_held;
+	bool joan_submitted;
+	struct list_head joan_list;
 	dma_addr_t dma_addr;
 	u32 size;
 	struct list_head reg_list;
@@ -456,6 +458,8 @@ struct venus_inst {
 	struct work_struct joan_reconf_work;
 	struct list_head joan_held_caps;
 	bool joan_enc_running;
+	bool joan_cap_ready;
+	struct delayed_work joan_in_work;
 	u32 joan_vis_w, joan_vis_h;
 	u32 joan_last_in_addr;
 	bool joan_first_in_sent;	/* 会话内是否已发过首个输入缓冲 */	/* EOS 空缓冲复用的真实输入地址 */

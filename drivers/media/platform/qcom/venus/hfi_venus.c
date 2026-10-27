@@ -502,6 +502,13 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
 		return -EINVAL;
 
 	cmd_packet = (struct hfi_pkt_hdr *)pkt;
+	if (cmd_packet->pkt_type == 0x211004) {
+		const u32 *w = pkt;
+
+		JOAN_VTRACE("etb_tx: sess=%u w=%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+			    w[2], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+			    w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+	}
 	hdev->last_packet_type = cmd_packet->pkt_type;
 
 	queue = &hdev->queues[IFACEQ_CMD_IDX];

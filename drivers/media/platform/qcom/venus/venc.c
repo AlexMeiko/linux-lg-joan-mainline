@@ -7,11 +7,21 @@
 #include <linux/module.h>
 
 /* 候选 46：编码器高度是否按 32 对齐（默认 0=只对齐到 2）*/
+unsigned int joan_enc_no_w_align;
+module_param(joan_enc_no_w_align, uint, 0644);
+MODULE_PARM_DESC(joan_enc_no_w_align, "joan: skip 128-pixel width alignment for encoder");
+
 unsigned int joan_enc_h_align32;
 
 unsigned int joan_enc_resubmit_inputs = 1;
 module_param(joan_enc_resubmit_inputs, uint, 0644);
 MODULE_PARM_DESC(joan_enc_resubmit_inputs, "joan: resubmit held encoder input buffers at streamon");
+
+extern unsigned int joan_enc_cap_before_input;
+
+unsigned int joan_enc_release_input = 1;
+module_param(joan_enc_release_input, uint, 0644);
+MODULE_PARM_DESC(joan_enc_release_input, "joan: release held input after capture submitted");
 
 unsigned int joan_enc_hold_caps = 1;
 module_param(joan_enc_hold_caps, uint, 0644);
@@ -226,7 +236,9 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 	pixmp->height = clamp(pixmp->height, frame_height_min(inst),
 			      frame_height_max(inst));
 
-	pixmp->width = ALIGN(pixmp->width, 128);
+	/* 候选 153：可选跳过 128 对齐（320 会被扩成 384，导致 app 按 384 步幅
+	 * 填 138240 字节，而固件期望的可见尺寸是 115200） */
+	pixmp->width = ALIGN(pixmp->width, joan_enc_no_w_align ? 2 : 128);
 	/*
 	 * 候选 46：原来高度按 32 对齐（240→256）。ffmpeg 的 v4l2m2m 在把 AVFrame
 	 * 拷进 V4L2 缓冲时用 **V4L2 的 height** 计算行数，帧只有 240 行时会越界读，
@@ -311,9 +323,14 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		inst->out_width = format.fmt.pix_mp.width;
 		inst->out_height = format.fmt.pix_mp.height;
+		/*
+		 * 候选 130：这里必须记录「应用请求的可见尺寸」（orig_pixmp），
+		 * 而不是驱动对齐后的 out_width（320x240 会被对齐成 384x240）。
+		 * 固件只接受可见尺寸的填入长度（320x240 NV12 = 115200）。
+		 */
 		if (!inst->joan_vis_w) {
-			inst->joan_vis_w = inst->out_width;
-			inst->joan_vis_h = inst->out_height;
+			inst->joan_vis_w = orig_pixmp.width;
+			inst->joan_vis_h = orig_pixmp.height;
 		}
 		inst->colorspace = pixmp->colorspace;
 		inst->ycbcr_enc = pixmp->ycbcr_enc;
@@ -1348,6 +1365,8 @@ static int venc_verify_conf(struct venus_inst *inst)
 	return 0;
 }
 
+static int venc_submit_pending_caps(struct venus_inst *inst);
+
 static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct venus_inst *inst = vb2_get_drv_priv(q);
@@ -1362,6 +1381,8 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 		inst->streamon_cap = 1;
 
 	joan_stat_start++;
+	joan_tlog("[st] type=%d count=%u running=%d\n", q->type, count,
+		  inst->joan_enc_running);
 	if (!(inst->streamon_out & inst->streamon_cap)) {
 		/*
 		 * 候选 119：ffmpeg 的 v4l2m2m 编码器会先把捕获缓冲 QBUF 进来，
@@ -1379,15 +1400,23 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 
 	if (inst->joan_enc_running) {
-		/* 候选 122：会话已跑起来，只需把扣住的捕获缓冲提交上去 */
-		if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-			struct venus_buffer *vbuf, *tmp;
+		/*
+		 * 候选 136：会话已由输出队列自动启动。这里只补提交「还没提交过」的
+		 * 捕获缓冲——转码时 ffmpeg 是在 STREAMON(out) 之后才排捕获缓冲的，
+		 * 自动启动那次队列还是空的。用每缓冲 joan_submitted 标记精确判断，
+		 * 避免同一缓冲重复进固件（重复会被固件判 0x1002）。
+		 */
+		if (joan_enc_cap_before_input &&
+		    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+			int n_cap = venc_submit_pending_caps(inst);
 
-			list_for_each_entry_safe(vbuf, tmp, &inst->joan_held_caps, list) {
-				list_del_init(&vbuf->list);
-				vbuf->joan_held = false;
-				venus_helper_process_one_buf(inst, &vbuf->vb);
-				joan_stat_capsub++;
+			joan_tlog("[r] 提交捕获 n=%d\n", n_cap);
+			if (n_cap)
+				inst->joan_cap_ready = true;
+			if (inst->joan_cap_ready && joan_enc_release_input) {
+				int r2 = venus_helper_process_initial_out_bufs(inst);
+
+				joan_tlog("[cap-ok] 补提交输入 ret=%d\n", r2);
 			}
 		}
 		mutex_unlock(&inst->lock);
@@ -1412,6 +1441,8 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto error;
 
 	ret = venc_set_properties(inst);
+	joan_tlog("[props] ret=%d %ux%u vis=%ux%u\n", ret, inst->width,
+		  inst->height, inst->joan_vis_w, inst->joan_vis_h);
 	if (ret)
 		goto error;
 
@@ -1428,18 +1459,20 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto error;
 
-	if (joan_enc_resubmit_inputs)
-		venus_helper_process_initial_out_bufs(inst);
+	/* 候选 139：捕获缓冲没就绪前不要提交输入帧 */
+	if (joan_enc_resubmit_inputs && inst->joan_cap_ready) {
+		int r9 = venus_helper_process_initial_out_bufs(inst);
+
+		joan_tlog("[in-ok] 启动时补提交输入 ret=%d\n", r9);
+	}
 
 	{
-		struct venus_buffer *vbuf, *tmp;
+		int n_cap = venc_submit_pending_caps(inst);
 
-		list_for_each_entry_safe(vbuf, tmp, &inst->joan_held_caps, list) {
-			list_del_init(&vbuf->list);
-			vbuf->joan_held = false;
-			venus_helper_process_one_buf(inst, &vbuf->vb);
-			joan_stat_capsub++;
-		}
+		joan_tlog("[s] 提交捕获 n=%d\n", n_cap);
+		if (n_cap)
+			inst->joan_cap_ready = true;
+		JOAN_VTRACE("venc_start_streaming: 提交暂缓捕获 n=%d", n_cap);
 	}
 
 	inst->enc_state = VENUS_ENC_STATE_ENCODING;
@@ -1461,6 +1494,34 @@ error:
 	return ret;
 }
 
+static void joan_in_work_fn(struct work_struct *work)
+{
+	struct venus_inst *inst = container_of(to_delayed_work(work),
+					      struct venus_inst, joan_in_work);
+	int r;
+
+	mutex_lock(&inst->lock);
+	r = venus_helper_process_initial_out_bufs(inst);
+	joan_tlog("[in-work] 补提交输入 ret=%d\n", r);
+	mutex_unlock(&inst->lock);
+}
+
+static int venc_submit_pending_caps(struct venus_inst *inst)
+{
+	struct venus_buffer *vbuf, *tmp;
+	int n_sub = 0;
+
+	list_for_each_entry_safe(vbuf, tmp, &inst->joan_held_caps, joan_list) {
+		list_del_init(&vbuf->joan_list);
+		vbuf->joan_held = false;
+		venus_helper_process_one_buf(inst, &vbuf->vb);
+		joan_stat_capsub++;
+		n_sub++;
+	}
+
+	return n_sub;
+}
+
 static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 {
 	JOAN_VTRACE("venc_buf_queue: type=%d index=%u", vb->type, vb->index);
@@ -1477,14 +1538,42 @@ static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 	 * 还是 STOPPED。转码时 ffmpeg 正是这样排捕获缓冲的，若当 drain 直接归还，
 	 * 固件永远没有输出缓冲，之后每一帧输入都被判 0x1002。
 	 */
+	joan_tlog("[q] t=%d i=%u ssc=%d held=%d run=%d pay=%u fl=%#x\n", vb->type,
+		  vb->index, vb2_start_streaming_called(vb->vb2_queue),
+		  to_venus_buffer(vbuf)->joan_held, inst->joan_enc_running,
+		  vb2_get_plane_payload(vb, 0), vbuf->flags);
+
 	if (joan_enc_hold_caps && V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
 	    !vb2_start_streaming_called(vb->vb2_queue)) {
 		struct venus_buffer *hb = to_venus_buffer(vbuf);
 
+		/*
+		 * 候选 126：照抄解码器已验证的做法——先把缓冲挂进 v4l2-m2m 队列，
+		 * 由 venus_helper_vb2_buf_queue() 因"两个队列都还没 STREAMON"而暂缓
+		 * 提交；等 start_streaming 真正启动会话后再用
+		 * venus_helper_process_initial_cap_bufs() 一次性提交。
+		 *
+		 * 同一缓冲会被 buf_queue 两次（app QBUF 一次、vb2 STREAMON 时再
+		 * enqueue 一次），用 joan_held 保证只挂一次，否则 m2m 链表损坏。
+		 */
 		if (!hb->joan_held) {
 			hb->joan_held = true;
 			joan_stat_hold++;
-			list_add_tail(&hb->list, &inst->joan_held_caps);
+			list_add_tail(&hb->joan_list, &inst->joan_held_caps);
+			/*
+			 * 候选 150：必须挂进 v4l2-m2m 的 ready 队列，否则固件回来的
+			 * 填缓冲完成事件按 index 找不到缓冲（remove_by_idx 只查 ready
+			 * 队列），完成事件会被静默丢弃，ffmpeg 永远等不到帧。
+			 * 只入队、不提交——提交留给 start_streaming 里的计数提交，
+			 * 保证每个缓冲只进固件一次。
+			 */
+			v4l2_m2m_buf_queue(inst->m2m_ctx, vbuf);
+			/*
+			 * 候选 147：这里只能"持有"，绝不能再调
+			 * venus_helper_vb2_buf_queue() —— 自动启动后两个队列都已置位，
+			 * 那个 helper 会立刻把缓冲提交给固件，随后 start_streaming
+			 * 里的计数提交又会提交一次，重复提交直接把固件打崩。
+			 */
 			JOAN_VTRACE("venc_buf_queue: 持有捕获 idx=%u", vb->index);
 		}
 		mutex_unlock(&inst->lock);
@@ -1532,6 +1621,14 @@ static void venc_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	vbuf = venus_helper_find_buf(inst, type, tag);
 	if (!vbuf)
 		return;
+
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		to_venus_buffer(vbuf)->joan_submitted = false;
+		joan_tlog("[done] cap tag=%u bytes=%u\n", tag, bytesused);
+	}
+
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		to_venus_buffer(vbuf)->joan_submitted = false;
 
 	vbuf->flags = flags;
 
@@ -1646,6 +1743,7 @@ static int venc_open(struct file *file)
 	INIT_LIST_HEAD(&inst->internalbufs);
 	INIT_LIST_HEAD(&inst->list);
 	INIT_LIST_HEAD(&inst->joan_held_caps);
+	INIT_DELAYED_WORK(&inst->joan_in_work, joan_in_work_fn);
 	mutex_init(&inst->lock);
 	mutex_init(&inst->ctx_q_lock);
 

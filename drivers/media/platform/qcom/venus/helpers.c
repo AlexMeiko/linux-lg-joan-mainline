@@ -24,8 +24,50 @@
 #include "pm_helpers.h"
 #include "hfi_platform.h"
 #include <linux/module.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 
 /* 候选 27：解码输入 flags 开关（bit0=CODECCONFIG, bit1=ENDOFFRAME），默认 0 */
+unsigned int joan_enc_cap_before_input = 1;
+module_param(joan_enc_cap_before_input, uint, 0644);
+MODULE_PARM_DESC(joan_enc_cap_before_input, "joan: submit capture buffers before releasing input");
+EXPORT_SYMBOL_GPL(joan_enc_cap_before_input);
+
+unsigned int joan_enc_clamp_fill = 1;
+module_param(joan_enc_clamp_fill, uint, 0644);
+MODULE_PARM_DESC(joan_enc_clamp_fill, "joan: clamp encoder input filled_len to visible size");
+
+/* 候选 136：驱动侧 trace 环，避免被 dmesg 环形缓冲冲掉 */
+char joan_trace_ring[8192];
+static DEFINE_SPINLOCK(joan_trace_lock);
+unsigned int joan_trace_ring_pos;
+module_param_string(joan_trace_ring, joan_trace_ring, sizeof(joan_trace_ring), 0444);
+
+void joan_tlog(const char *fmt, ...)
+{
+	char tmp[192];
+	va_list args;
+	unsigned long flags;
+	int n;
+
+	va_start(args, fmt);
+	n = vsnprintf(tmp, sizeof(tmp), fmt, args);
+	va_end(args);
+	if (n <= 0)
+		return;
+	if (n >= (int)sizeof(tmp))
+		n = sizeof(tmp) - 1;
+
+	spin_lock_irqsave(&joan_trace_lock, flags);
+	if (joan_trace_ring_pos + n + 1 >= sizeof(joan_trace_ring))
+		joan_trace_ring_pos = 0;
+	memcpy(joan_trace_ring + joan_trace_ring_pos, tmp, n);
+	joan_trace_ring_pos += n;
+	joan_trace_ring[joan_trace_ring_pos] = '\0';
+	spin_unlock_irqrestore(&joan_trace_lock, flags);
+}
+EXPORT_SYMBOL_GPL(joan_tlog);
+
 unsigned int joan_in_flags;
 module_param(joan_in_flags, uint, 0644);
 MODULE_PARM_DESC(joan_in_flags, "joan: decoder input flags (1=CODECCONFIG, 2=ENDOFFRAME)");
@@ -527,11 +569,19 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 	do_div(fdata.timestamp, NSEC_PER_USEC);
 	fdata.flags = 0;
 	fdata.clnt_data = vbuf->vb2_buf.index;
+	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC)
+		to_venus_buffer(vbuf)->joan_submitted = true;
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && fdata.device_addr)
 		inst->joan_last_in_addr = fdata.device_addr;
-	JOAN_VTRACE("session_process_buf: type=%u index=%u clnt=%u alloc=%u filled=%u iova=%pad",
-		    type, vb->index, fdata.clnt_data, fdata.alloc_len,
-		    vb2_get_plane_payload(vb, 0), &fdata.device_addr);
+	if (inst->session_type == VIDC_SESSION_TYPE_DEC)
+		joan_tlog("[dec] t=%u i=%u iova=%pad al=%u\n", type, vb->index,
+			  &fdata.device_addr, fdata.alloc_len);
+
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC)
+		JOAN_VTRACE("session_process_buf: st=%u type=%u index=%u alloc=%u filled=%u iova=%pad",
+			    inst->session_type, type, vb->index, fdata.alloc_len,
+			    vb2_get_plane_payload(vb, 0), &fdata.device_addr);
 
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		fdata.buffer_type = HFI_BUFFER_INPUT;
@@ -550,7 +600,14 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 		 * 候选 91：msm8998 编码固件只接受「可见尺寸」的填入长度
 		 * （320x240 NV12 = 115200），对齐后的 138240 会返回 0x1002。
 		 */
-		if (inst->session_type == VIDC_SESSION_TYPE_ENC &&
+		if (inst->session_type == VIDC_SESSION_TYPE_ENC)
+			JOAN_VTRACE("ENC 输入: alloc=%u filled=%u vis=%ux%u hfi_flags=%#x v4l2_flags=%#x",
+				    fdata.alloc_len, fdata.filled_len,
+				    inst->joan_vis_w, inst->joan_vis_h,
+				    fdata.flags, vbuf->flags);
+
+		if (joan_enc_clamp_fill &&
+		    inst->session_type == VIDC_SESSION_TYPE_ENC &&
 		    inst->joan_vis_w && inst->joan_vis_h) {
 			u32 vis = inst->joan_vis_w * inst->joan_vis_h * 3 / 2;
 
@@ -1595,6 +1652,18 @@ void venus_helper_vb2_buf_queue(struct vb2_buffer *vb)
 		return;
 
 	/*
+	 * 候选 139：编码器必须先把捕获（输出）缓冲交给固件，才能提交输入帧。
+	 * 否则固件在"没有输出缓冲"的状态下收到输入，会把该帧判 0x1002 并把
+	 * 会话带进错误状态（转码时表现为之后每一帧都被拒、最后 System error）。
+	 */
+	if (joan_enc_cap_before_input &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) && !inst->joan_cap_ready) {
+		joan_tlog("[hold-in] idx=%u\n", vb->index);
+		return;
+	}
+
+	/*
 	 * 候选 67：解码器在 SOURCE_CHANGE 之后、用户态重配完成之前，
 	 * 不要再把新的输入缓冲灌给固件 —— 实测固件此时收到新数据会先报
 	 * "缓冲不足"(0x1000002)，随后直接 SYS_ERROR。
@@ -1666,17 +1735,8 @@ void venus_helper_vb2_stop_streaming(struct vb2_queue *q)
 		INIT_LIST_HEAD(&inst->registeredbufs);
 	}
 
-	if (inst->session_type == VIDC_SESSION_TYPE_ENC) {
-		struct venus_buffer *vbuf, *tmp;
-
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC)
 		inst->joan_enc_running = false;
-		list_for_each_entry_safe(vbuf, tmp, &inst->joan_held_caps, list) {
-			list_del_init(&vbuf->list);
-			vbuf->joan_held = false;
-			vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, 0);
-			v4l2_m2m_buf_done(&vbuf->vb, VB2_BUF_STATE_ERROR);
-		}
-	}
 
 	venus_helper_buffers_done(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 				  VB2_BUF_STATE_ERROR);

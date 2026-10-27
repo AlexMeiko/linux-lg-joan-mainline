@@ -63,6 +63,7 @@ int venus_helper_intbufs_free(struct venus_inst *inst);
 int venus_helper_intbufs_realloc(struct venus_inst *inst);
 int venus_helper_queue_dpb_bufs(struct venus_inst *inst);
 int venus_helper_unregister_bufs(struct venus_inst *inst);
+void joan_tlog(const char *fmt, ...);
 int venus_helper_process_one_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf);
 int venus_helper_process_initial_cap_bufs(struct venus_inst *inst);
 int venus_helper_process_initial_out_bufs(struct venus_inst *inst);
