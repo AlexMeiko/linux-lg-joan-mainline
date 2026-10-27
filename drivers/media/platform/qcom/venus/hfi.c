@@ -20,8 +20,105 @@
 #include "hfi.h"
 #include "hfi_cmds.h"
 #include "hfi_venus.h"
+#include "helpers.h"
 
 #define TIMEOUT		msecs_to_jiffies(1000)
+
+extern unsigned int joan_enc_prewarm;
+extern unsigned int joan_no_rpm;
+
+static int hfi_session_init_direct(struct venus_inst *inst, u32 pixfmt);
+
+static void joan_warm_event(struct venus_inst *inst, u32 event,
+			    struct hfi_event_data *data)
+{
+	inst->session_error = true;
+	joan_tlog("[warm] event=%u id=%#x error=%#x\n", event, inst->id,
+		  inst->error);
+}
+
+static const struct hfi_inst_ops joan_warm_ops = {
+	.event_notify = joan_warm_event,
+};
+
+/* Called with joan_warm_lock held and with the core powered. */
+static int joan_prewarm_encoder_locked(struct venus_core *core)
+{
+	struct venus_inst *warm, *other;
+	int ret;
+
+	if (core->joan_warm_enc)
+		return 0;
+	if (!joan_no_rpm || !IS_V3(core) || core->state != CORE_INIT)
+		return -EINVAL;
+
+	/* A replacement must also precede every live decoder session. */
+	mutex_lock(&core->lock);
+	list_for_each_entry(other, &core->instances, list) {
+		if (other->session_type == VIDC_SESSION_TYPE_DEC &&
+		    other->state != INST_UNINIT) {
+			mutex_unlock(&core->lock);
+			return -EBUSY;
+		}
+	}
+	mutex_unlock(&core->lock);
+
+	warm = kzalloc(sizeof(*warm), GFP_KERNEL);
+	if (!warm)
+		return -ENOMEM;
+	warm->core = core;
+	warm->session_type = VIDC_SESSION_TYPE_ENC;
+	warm->joan_owns_warm = true;
+	mutex_init(&warm->lock);
+	INIT_LIST_HEAD(&warm->list);
+
+	ret = hfi_session_create(warm, &joan_warm_ops);
+	if (ret)
+		goto free;
+	ret = hfi_session_init_direct(warm, V4L2_PIX_FMT_H264);
+	joan_tlog("[warm] create id=%#x state=%u core=%u ret=%d\n",
+		  warm->id, warm->state, core->state, ret);
+	if (ret) {
+		hfi_session_destroy(warm);
+		synchronize_irq(core->irq);
+		goto free;
+	}
+	core->joan_warm_enc = warm;
+	return 0;
+free:
+	mutex_destroy(&warm->lock);
+	kfree(warm);
+	return ret;
+}
+
+int hfi_joan_prewarm_encoder(struct venus_core *core)
+{
+	int ret;
+
+	if (!joan_enc_prewarm)
+		return 0;
+	mutex_lock(&core->joan_warm_lock);
+	ret = joan_prewarm_encoder_locked(core);
+	mutex_unlock(&core->joan_warm_lock);
+	return ret;
+}
+
+void hfi_joan_drop_warm_encoder(struct venus_core *core)
+{
+	struct venus_inst *warm;
+
+	mutex_lock(&core->joan_warm_lock);
+	warm = core->joan_warm_enc;
+	if (warm) {
+		core->joan_warm_enc = NULL;
+		hfi_session_deinit(warm);
+		hfi_session_destroy(warm);
+		synchronize_irq(core->irq);
+		mutex_destroy(&warm->lock);
+		kfree(warm);
+	}
+	mutex_unlock(&core->joan_warm_lock);
+}
 
 static u32 to_codec_type(u32 pixfmt)
 {
@@ -219,7 +316,7 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(hfi_session_create);
 
-int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
+static int hfi_session_init_direct(struct venus_inst *inst, u32 pixfmt)
 {
 	struct venus_core *core = inst->core;
 	const struct hfi_ops *ops = core->ops;
@@ -253,6 +350,8 @@ int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
 		return ret;
 
 	ret = wait_session_msg(inst);
+	joan_tlog("[init] id=%#x type=%u codec=%#x ret=%d\n",
+		  inst->id, inst->session_type, pixfmt, ret);
 	JOAN_VTRACE("hfi_session_init: wait_session_msg ret=%d", ret);
 	if (ret)
 		return ret;
@@ -260,6 +359,53 @@ int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
 	inst->state = INST_INIT;
 
 	return 0;
+}
+
+int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
+{
+	struct venus_core *core = inst->core;
+	struct venus_inst *warm;
+	int ret;
+
+	if (!joan_enc_prewarm)
+		return hfi_session_init_direct(inst, pixfmt);
+	if (inst->state != INST_UNINIT)
+		return -EALREADY;
+
+	mutex_lock(&core->joan_warm_lock);
+	if (inst->session_type == VIDC_SESSION_TYPE_DEC) {
+		ret = joan_prewarm_encoder_locked(core);
+		if (ret) {
+			joan_tlog("[warm] replenish ret=%d\n", ret);
+			goto unlock;
+		}
+	}
+
+	warm = core->joan_warm_enc;
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    pixfmt == V4L2_PIX_FMT_H264 && warm &&
+	    warm->state == INST_INIT && !warm->session_error) {
+		/* Change the reply lookup atomically; firmware retains the session. */
+		mutex_lock(&core->lock);
+		inst->id = warm->id;
+		inst->hfi_codec = warm->hfi_codec;
+		inst->state = INST_INIT;
+		core->joan_warm_enc = NULL;
+		list_del_init(&warm->list);
+		if (atomic_dec_and_test(&core->insts_count))
+			wake_up_var(&core->insts_count);
+		mutex_unlock(&core->lock);
+		synchronize_irq(core->irq);
+		mutex_destroy(&warm->lock);
+		kfree(warm);
+		joan_tlog("[warm] adopt id=%#x state=%u\n", inst->id, inst->state);
+		ret = 0;
+	} else {
+		ret = hfi_session_init_direct(inst, pixfmt);
+	}
+unlock:
+	mutex_unlock(&core->joan_warm_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(hfi_session_init);
 

@@ -12,6 +12,15 @@ unsigned int joan_enc_no_w_align;
 module_param(joan_enc_no_w_align, uint, 0644);
 MODULE_PARM_DESC(joan_enc_no_w_align, "joan: skip 128-pixel width alignment for encoder");
 
+static bool joan_enc_uv_align32 = true;
+module_param(joan_enc_uv_align32, bool, 0644);
+MODULE_PARM_DESC(joan_enc_uv_align32, "joan: encoder UV plane starts after ALIGN(height,32) rows");
+
+static bool joan_enc_nv12_repack = true;
+module_param(joan_enc_nv12_repack, bool, 0644);
+MODULE_PARM_DESC(joan_enc_nv12_repack,
+		"joan: repack MMAP NV12 chroma to Venus scanline alignment");
+
 unsigned int joan_enc_repush_props;
 module_param(joan_enc_repush_props, uint, 0644);
 MODULE_PARM_DESC(joan_enc_repush_props, "joan: re-send encoder properties after session start");
@@ -27,9 +36,6 @@ module_param(joan_enc_resubmit_inputs, uint, 0644);
 MODULE_PARM_DESC(joan_enc_resubmit_inputs, "joan: resubmit held encoder input buffers at streamon");
 
 extern unsigned int joan_enc_cap_before_input;
-extern unsigned int joan_enc_prewarm;
-static u32 joan_warm_id;
-static bool joan_warm_valid;
 extern unsigned int joan_enc_reload_res;
 extern unsigned int joan_enc_recover;
 
@@ -313,6 +319,15 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		return -EBUSY;
 
 	orig_pixmp = *pixmp;
+
+	/*
+	 * 4:2:0 需要偶数宽高，过小尺寸固件无法构成合法帧。
+	 * 必须在 clamp/对齐之前用调用方原始值判断，否则 1920x1 这类
+	 * 会被 clamp 到最小高度后放行，最终产出垃圾码流。
+	 */
+	if ((orig_pixmp.width & 1) || (orig_pixmp.height & 1) ||
+	    orig_pixmp.width < 16 || orig_pixmp.height < 16)
+		return -EINVAL;
 
 	fmt = venc_try_fmt_common(inst, f);
 	if (!fmt)
@@ -1658,11 +1673,113 @@ static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 	mutex_unlock(&inst->lock);
 }
 
+static int venc_buf_prepare(struct vb2_buffer *vb)
+{
+	struct venus_inst *inst = vb2_get_drv_priv(vb->vb2_queue);
+	u32 src_stride, dst_stride, y_rows, uv_rows;
+	u32 src_uv, dst_uv, dst_y_size;
+	u32 payload, bufsize;
+	void *data;
+	int ret, r;
+
+	ret = venus_helper_vb2_buf_prepare(vb);
+	joan_tlog("[prep] ret=%d repack=%d type=%u fmt=%#x pay=%u\n", ret,
+		  joan_enc_nv12_repack, vb->type, inst->fmt_out->pixfmt,
+		  vb2_get_plane_payload(vb, 0));
+	if (ret || !joan_enc_nv12_repack ||
+	    vb->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ||
+	    inst->fmt_out->pixfmt != V4L2_PIX_FMT_NV12)
+		return ret;
+
+	payload = vb2_get_plane_payload(vb, 0);
+	bufsize = vb2_plane_size(vb, 0);
+	if (!payload || vb->memory != VB2_MEMORY_MMAP || vb->planes[0].data_offset)
+		return 0;
+
+	/*
+	 * 用户态（ffmpeg v4l2m2m）按**可见尺寸的紧凑布局**填数据：
+	 *   Y: width x height，UV 紧跟其后，载荷 = width*height*3/2。
+	 * 而 Venus 硬件按 128 对齐步幅、32 行对齐高度取图：
+	 *   Y: ALIGN(width,128) x ALIGN(height,32)，UV 起点在 Y 平面之后。
+	 * 两者在 320x240 这类尺寸上差 64 字节/行、16 行，直接喂进去画面会
+	 * 从中间开始错位（实测上 1/3 彩条乱码、下 2/3 纯绿）。
+	 * 这里在 QBUF 之前把紧凑布局重排成硬件布局。
+	 */
+	y_rows = inst->out_height;
+	uv_rows = DIV_ROUND_UP(inst->out_height, 2);
+	/*
+	 * 源步幅不能直接用 inst->out_width —— 那是 S_FMT 之后的对齐值（384）。
+	 * 用户态实际是按**可见宽度**紧凑填充的，所以从载荷反推：
+	 *   payload = src_stride * (y_rows + uv_rows)
+	 */
+	if (!(y_rows + uv_rows))
+		return 0;
+	src_stride = payload / (y_rows + uv_rows);
+	if (src_stride * (y_rows + uv_rows) != payload)
+		return 0;
+	dst_stride = ALIGN(inst->out_width, 128);
+	/* 宽度已经 128 对齐时 src==dst，但 UV 平面仍需按行数对齐搬迁，
+	 * 不能在这里直接返回（否则 720p/1080p 的色度会错位成重影）。 */
+	if (dst_stride < src_stride)
+		return 0;
+	src_uv = src_stride * y_rows;
+	dst_y_size = dst_stride * ALIGN(y_rows, joan_enc_uv_align32 ? 32 : 2);
+	dst_uv = dst_y_size;
+
+	joan_tlog("[rp] w=%u h=%u pay=%u buf=%u src=%u dst=%u srcuv=%u dstuv=%u\n",
+		  inst->out_width, inst->out_height, payload, bufsize,
+		  src_stride, dst_stride, src_uv, dst_uv);
+	/* 已经是硬件布局（载荷覆盖到 UV 末尾）就不动 */
+	if (payload >= dst_uv + dst_stride * ALIGN(uv_rows, 16)) {
+		joan_tlog("[rp] skip: 已是硬件布局\n");
+		return 0;
+	}
+	/* 只处理"紧凑布局"这一种已知输入 */
+	if (payload < src_uv + src_stride * uv_rows) {
+		joan_tlog("[rp] skip: 载荷不足\n");
+		return 0;
+	}
+	if (dst_uv + dst_stride * ALIGN(uv_rows, 16) > bufsize) {
+		joan_tlog("[rp] skip: 缓冲不够\n");
+		return 0;
+	}
+
+	data = vb2_plane_vaddr(vb, 0);
+	if (!data)
+		return -EFAULT;
+
+	/*
+	 * 顺序很关键：必须先搬 UV，再搬 Y。
+	 * Y 的目标区间（0 .. dst_uv）会覆盖 UV 的源区间（src_uv ..），
+	 * 先搬 Y 会把还没搬走的 UV 数据踩掉 —— 实测表现为整幅横向彩条。
+	 * 两次都从后往前，避免同一平面内自我覆盖。
+	 */
+	if (src_uv != dst_uv || src_stride != dst_stride) {
+		for (r = (int)uv_rows - 1; r >= 0; r--)
+			memmove(data + dst_uv + (u32)r * dst_stride,
+				data + src_uv + (u32)r * src_stride, src_stride);
+	}
+	if (src_stride != dst_stride) {
+		for (r = (int)y_rows - 1; r >= 0; r--)
+			memmove(data + (u32)r * dst_stride,
+				data + (u32)r * src_stride, src_stride);
+	}
+	/* Y 尾部空洞与 UV 末行补齐填中性色度 */
+	if (dst_y_size > dst_stride * y_rows)
+		memset(data + dst_stride * y_rows, 16,
+		       dst_y_size - dst_stride * y_rows);
+	if (dst_stride * ALIGN(uv_rows, 16) > dst_stride * uv_rows)
+		memset(data + dst_uv + dst_stride * uv_rows, 16,
+		       dst_stride * (ALIGN(uv_rows, 16) - uv_rows));
+	dma_wmb();
+	return 0;
+}
+
 static const struct vb2_ops venc_vb2_ops = {
 	.queue_setup = venc_queue_setup,
 	.buf_init = venc_buf_init,
 	.buf_cleanup = venc_buf_cleanup,
-	.buf_prepare = venus_helper_vb2_buf_prepare,
+	.buf_prepare = venc_buf_prepare,
 	.start_streaming = venc_start_streaming,
 	.stop_streaming = venus_helper_vb2_stop_streaming,
 	.buf_queue = venc_vb2_buf_queue,
@@ -1810,20 +1927,6 @@ static int venc_open(struct file *file)
 	INIT_LIST_HEAD(&inst->joan_held_caps);
 	INIT_DELAYED_WORK(&inst->joan_in_work, joan_in_work_fn);
 	INIT_WORK(&inst->joan_rec_work, joan_rec_work_fn);
-	inst->joan_owns_warm = false;
-	if (joan_enc_prewarm) {
-		if (joan_warm_valid) {
-			inst->id = joan_warm_id;
-			joan_warm_valid = false;
-			joan_tlog("[warm] 接管预热会话 id=%#x\n", inst->id);
-		} else {
-			venus_helper_init_instance(inst);
-			joan_warm_id = inst->id;
-			joan_warm_valid = true;
-			inst->joan_owns_warm = true;
-			joan_tlog("[warm] 新建预热会话 id=%#x\n", inst->id);
-		}
-	}
 	mutex_init(&inst->lock);
 	mutex_init(&inst->ctx_q_lock);
 

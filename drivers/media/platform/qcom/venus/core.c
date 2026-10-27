@@ -109,6 +109,8 @@ static void venus_sys_error_handler(struct work_struct *work)
 			container_of(work, struct venus_core, work.work);
 	int ret, i, max_attempts = RPM_WAIT_FOR_IDLE_MAX_ATTEMPTS;
 
+	hfi_joan_drop_warm_encoder(core);
+
 	if (joan_no_recover) {
 		JOAN_VTRACE("sys_error: joan_no_recover=1, skip recovery");
 		core->state = CORE_UNINIT;
@@ -767,6 +769,7 @@ static int venus_probe(struct platform_device *pdev)
 	mutex_init(&core->lock);
 	mutex_init(&core->joan_seq_lock);
 	mutex_init(&core->joan_cfg_lock);
+	mutex_init(&core->joan_warm_lock);
 	INIT_DELAYED_WORK(&core->work, venus_sys_error_handler);
 	init_waitqueue_head(&core->sys_err_done);
 
@@ -902,6 +905,10 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_of_depopulate;
 
+	ret = hfi_joan_prewarm_encoder(core);
+	if (ret)
+		goto err_of_depopulate;
+
 	/*
 	 * 候选 50（临时稳定化开关）：msm8998 上「空闲掉电 -> 恢复」路径仍然会触发
 	 * 固件 System error（power_on/boot_core 都返回 0，随后报错并无法恢复）。
@@ -923,6 +930,7 @@ static int venus_probe(struct platform_device *pdev)
 	return 0;
 
 err_of_depopulate:
+	hfi_joan_drop_warm_encoder(core);
 	of_platform_depopulate(dev);
 err_remove_dynamic_nodes:
 	venus_remove_dynamic_nodes(core);
@@ -976,6 +984,7 @@ static void venus_remove(struct platform_device *pdev)
 	ret = pm_runtime_get_sync(dev);
 	WARN_ON(ret < 0);
 
+	hfi_joan_drop_warm_encoder(core);
 	ret = hfi_core_deinit(core, true);
 	WARN_ON(ret);
 

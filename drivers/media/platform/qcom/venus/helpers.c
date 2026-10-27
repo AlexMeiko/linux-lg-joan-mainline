@@ -29,9 +29,15 @@
 
 /* 候选 27：解码输入 flags 开关（bit0=CODECCONFIG, bit1=ENDOFFRAME），默认 0 */
 unsigned int joan_enc_prewarm;
-module_param(joan_enc_prewarm, uint, 0644);
-MODULE_PARM_DESC(joan_enc_prewarm, "joan: prewarm encoder HFI session at open, adopt on next open");
+module_param(joan_enc_prewarm, uint, 0444);
+MODULE_PARM_DESC(joan_enc_prewarm, "joan: reserve H264 encoder before decoder init (requires joan_no_rpm=1)");
 EXPORT_SYMBOL_GPL(joan_enc_prewarm);
+
+bool joan_dec_clean_stream = true;
+module_param(joan_dec_clean_stream, bool, 0644);
+MODULE_PARM_DESC(joan_dec_clean_stream,
+		"joan: track decoder submissions and recycle empty reconfiguration buffers");
+EXPORT_SYMBOL_GPL(joan_dec_clean_stream);
 
 unsigned int joan_enc_recover;
 module_param(joan_enc_recover, uint, 0644);
@@ -89,6 +95,11 @@ void joan_tlog(const char *fmt, ...)
 	spin_unlock_irqrestore(&joan_trace_lock, flags);
 }
 EXPORT_SYMBOL_GPL(joan_tlog);
+
+unsigned int joan_trace_quiet;
+module_param(joan_trace_quiet, uint, 0644);
+MODULE_PARM_DESC(joan_trace_quiet, "joan: suppress per-buffer/hfi trace lines");
+EXPORT_SYMBOL_GPL(joan_trace_quiet);
 
 unsigned int joan_in_flags;
 module_param(joan_in_flags, uint, 0644);
@@ -583,6 +594,12 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 	struct vb2_buffer *vb = &vbuf->vb2_buf;
 	unsigned int type = vb->type;
 	struct hfi_frame_data fdata;
+	int ret;
+
+	/* Ready queues also contain buffers which firmware is still processing. */
+	if (joan_dec_clean_stream &&
+	    inst->session_type == VIDC_SESSION_TYPE_DEC && buf->joan_submitted)
+		return 0;
 
 	memset(&fdata, 0, sizeof(fdata));
 	fdata.alloc_len = buf->size;
@@ -596,7 +613,7 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 		to_venus_buffer(vbuf)->joan_submitted = true;
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && fdata.device_addr)
 		inst->joan_last_in_addr = fdata.device_addr;
-	if (inst->session_type == VIDC_SESSION_TYPE_DEC)
+	if (!joan_trace_quiet && inst->session_type == VIDC_SESSION_TYPE_DEC)
 		joan_tlog("[dec] t=%u i=%u iova=%pad al=%u\n", type, vb->index,
 			  &fdata.device_addr, fdata.alloc_len);
 
@@ -699,7 +716,12 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 		}
 	}
 
-	return hfi_session_process_buf(inst, &fdata);
+	if (joan_dec_clean_stream && inst->session_type == VIDC_SESSION_TYPE_DEC)
+		buf->joan_submitted = true;
+	ret = hfi_session_process_buf(inst, &fdata);
+	if (ret && inst->session_type == VIDC_SESSION_TYPE_DEC)
+		buf->joan_submitted = false;
+	return ret;
 }
 
 static bool is_dynamic_bufmode(struct venus_inst *inst)
@@ -1728,11 +1750,19 @@ void venus_helper_buffers_done(struct venus_inst *inst, unsigned int type,
 	struct vb2_v4l2_buffer *buf;
 
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-		while ((buf = v4l2_m2m_src_buf_remove(inst->m2m_ctx)))
+		while ((buf = v4l2_m2m_src_buf_remove(inst->m2m_ctx))) {
+			if (joan_dec_clean_stream &&
+			    inst->session_type == VIDC_SESSION_TYPE_DEC)
+				to_venus_buffer(buf)->joan_submitted = false;
 			v4l2_m2m_buf_done(buf, state);
+		}
 	} else if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		while ((buf = v4l2_m2m_dst_buf_remove(inst->m2m_ctx)))
+		while ((buf = v4l2_m2m_dst_buf_remove(inst->m2m_ctx))) {
+			if (joan_dec_clean_stream &&
+			    inst->session_type == VIDC_SESSION_TYPE_DEC)
+				to_venus_buffer(buf)->joan_submitted = false;
 			v4l2_m2m_buf_done(buf, state);
+		}
 	}
 }
 EXPORT_SYMBOL_GPL(venus_helper_buffers_done);
@@ -1946,8 +1976,6 @@ EXPORT_SYMBOL_GPL(venus_helper_session_init);
 
 void venus_helper_init_instance(struct venus_inst *inst)
 {
-	if (inst->id && joan_enc_prewarm)
-		return;
 	if (inst->session_type == VIDC_SESSION_TYPE_DEC) {
 		INIT_LIST_HEAD(&inst->delayed_process);
 		INIT_WORK(&inst->delayed_process_work,

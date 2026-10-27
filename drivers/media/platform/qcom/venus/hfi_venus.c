@@ -21,6 +21,8 @@
 #include "hfi_venus_io.h"
 #include "firmware.h"
 
+extern unsigned int joan_trace_quiet;
+
 #ifndef JOAN_VTRACE
 #define JOAN_VTRACE(fmt, ...) do { \
 	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
@@ -506,7 +508,7 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
 	{
 		static unsigned int joan_cmd_dump;
 
-		if (joan_cmd_dump < 150) {
+		if (!joan_trace_quiet && joan_cmd_dump < 150) {
 			const u32 *w = pkt;
 
 			joan_cmd_dump++;
@@ -1648,6 +1650,11 @@ static int venus_session_init(struct venus_inst *inst, u32 session_type,
 	struct venus_hfi_device *hdev = to_hfi_priv(inst->core);
 	struct hfi_session_init_pkt pkt;
 	int ret;
+
+	if (inst->joan_owns_warm)
+		joan_tlog("[warm-hdev] state=%u power=%u suspended=%u core=%u\n",
+			  hdev->state, hdev->power_enabled, hdev->suspended,
+			  inst->core->state);
 
 	ret = venus_sys_set_debug(hdev, venus_fw_debug);
 	if (ret)

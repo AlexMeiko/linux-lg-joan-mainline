@@ -11,6 +11,7 @@
 } while (0)
 #endif
 #include <linux/module.h>
+#include <linux/math64.h>
 
 /* 候选 76：reconfig 期间是否丢弃空的捕获完成（默认 0=正常完成）*/
 unsigned int joan_dec_drop_empty;
@@ -23,9 +24,19 @@ module_param(joan_dec_early_cap_reg, uint, 0644);
 MODULE_PARM_DESC(joan_dec_early_cap_reg, "joan: register capture buffers before source change");
 
 /* 候选 62：解码器收到序列变化后由驱动内部完成重配（对用户态透明）*/
+extern unsigned int joan_trace_quiet;
+unsigned int joan_dec_repack;
+module_param(joan_dec_repack, uint, 0644);
+MODULE_PARM_DESC(joan_dec_repack, "joan: repack decoder capture to compact NV12 layout");
+
 unsigned int joan_dec_transparent_reconfig;
 module_param(joan_dec_transparent_reconfig, uint, 0644);
 MODULE_PARM_DESC(joan_dec_transparent_reconfig, "joan: handle decoder source change inside driver");
+
+static bool joan_dec_ts_fallback = true;
+module_param(joan_dec_ts_fallback, bool, 0644);
+MODULE_PARM_DESC(joan_dec_ts_fallback,
+		"joan: replace repeated capture timestamps at the negotiated frame rate");
 
 /* 候选 51：解码 G_FMT 在 INIT 状态是否放行（默认 0，保持原语义）*/
 unsigned int joan_dec_gfmt_noblock;
@@ -375,6 +386,13 @@ static int vdec_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	vdec_try_fmt_common(inst, f);
 
+	if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		joan_tlog("[gfmt] cap=%ux%u bpl=%u size=%u inst=%ux%u crop=%ux%u\n",
+			  pixmp->width, pixmp->height,
+			  pixmp->plane_fmt[0].bytesperline,
+			  pixmp->plane_fmt[0].sizeimage, inst->width,
+			  inst->height, inst->crop.width, inst->crop.height);
+
 	return 0;
 }
 
@@ -399,6 +417,15 @@ static int vdec_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		return -EBUSY;
 
 	orig_pixmp = *pixmp;
+
+	/*
+	 * 4:2:0 需要偶数宽高，过小尺寸固件无法构成合法帧。
+	 * 必须在 clamp/对齐之前用调用方原始值判断，否则 1920x1 这类
+	 * 会被 clamp 到最小高度后放行，最终产出垃圾码流。
+	 */
+	if ((orig_pixmp.width & 1) || (orig_pixmp.height & 1) ||
+	    orig_pixmp.width < 16 || orig_pixmp.height < 16)
+		return -EINVAL;
 
 	fmt = vdec_try_fmt_common(inst, f);
 
@@ -1387,6 +1414,7 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	mutex_lock(&inst->lock);
 
+	inst->joan_dec_stopping = false;
 	JOAN_VTRACE("vdec_start_streaming: type=%d count=%u", q->type, count);
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		ret = vdec_start_capture(inst);
@@ -1508,6 +1536,7 @@ static void vdec_stop_streaming(struct vb2_queue *q)
 
 	mutex_lock(&inst->lock);
 
+	inst->joan_dec_stopping = true;
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		ret = vdec_stop_capture(inst);
 	else
@@ -1539,6 +1568,11 @@ static void vdec_session_release(struct venus_inst *inst)
 
 	mutex_lock(&inst->lock);
 	inst->codec_state = VENUS_DEC_STATE_DEINIT;
+	inst->joan_dec_stopping = true;
+	if (joan_dec_ts_fallback || joan_dec_clean_stream)
+		JOAN_VTRACE("decoder summary: id=%#x empty_recycled=%u ts_fixups=%u",
+			    inst->id, inst->joan_dec_empty_recycled,
+			    inst->joan_dec_ts_fixups);
 
 	ret = hfi_session_stop(inst);
 	abort = (ret && ret != -EINVAL) ? 1 : 0;
@@ -1629,6 +1663,62 @@ static const struct vb2_ops vdec_vb2_ops = {
 	.buf_queue = vdec_vb2_buf_queue,
 };
 
+
+/*
+ * 解码输出布局转换：
+ *   固件按 128 对齐步幅、32 行对齐高度写 NV12
+ *     Y: ALIGN(w,128) x ALIGN(h,32)，UV 紧随其后；
+ *   而用户态（ffmpeg v4l2m2m）按可见尺寸紧凑读写
+ *     Y: w x h，UV 紧跟其后，每帧 w*h*3/2 字节。
+ * 两者不一致时，ffmpeg 每帧都从错误偏移开始读，画面是纯绿 + 横纹
+ * （实测 PSNR ≈ 5 dB）。这里在交还缓冲之前把固件布局搬成紧凑布局。
+ * 顺序：先 Y（目标区间 0..w*h 不碰 UV 源），再 UV（逐行 src>dst，从后往前）。
+ */
+static void joan_dec_repack_capture(struct venus_inst *inst,
+				    struct vb2_v4l2_buffer *vbuf,
+				    u32 bytesused)
+{
+	struct vb2_buffer *vb = &vbuf->vb2_buf;
+	u32 vis_w = inst->crop.width ? inst->crop.width : inst->width;
+	u32 vis_h = inst->crop.height ? inst->crop.height : inst->height;
+	u32 src_stride = ALIGN(inst->width, 128);
+	u32 src_rows = inst->height;
+	u32 dst_stride = vis_w;
+	u32 dst_rows = vis_h;
+	u32 uv_rows = DIV_ROUND_UP(vis_h, 2);
+	u32 src_uv = src_stride * src_rows;
+	u32 dst_uv = dst_stride * dst_rows;
+	u32 need = dst_uv + dst_stride * uv_rows;
+	void *data;
+	int r;
+
+	if (!joan_dec_repack || !bytesused || vb->memory != VB2_MEMORY_MMAP)
+		return;
+	if (vb->planes[0].data_offset || dst_stride == src_stride)
+		return;
+	if (need > vb2_plane_size(vb, 0) || need > bytesused)
+		return;
+	if (src_uv + src_stride * DIV_ROUND_UP(src_rows, 2) >
+	    vb2_plane_size(vb, 0))
+		return;
+
+	data = vb2_plane_vaddr(vb, 0);
+	if (!data)
+		return;
+
+	/* 1) Y 平面：从后往前，src_stride -> dst_stride */
+	for (r = (int)dst_rows - 1; r >= 0; r--)
+		memmove(data + (u32)r * dst_stride,
+			data + (u32)r * src_stride, dst_stride);
+	/* 2) UV 平面：从后往前，src 始终在 dst 之后，安全 */
+	for (r = (int)uv_rows - 1; r >= 0; r--)
+		memmove(data + dst_uv + (u32)r * dst_stride,
+			data + src_uv + (u32)r * src_stride, dst_stride);
+	dma_wmb();
+
+	vb2_set_plane_payload(vb, 0, need);
+}
+
 static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 			  u32 tag, u32 bytesused, u32 data_offset, u32 flags,
 			  u32 hfi_flags, u64 timestamp_us)
@@ -1646,7 +1736,7 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
 	vbuf = venus_helper_find_buf(inst, type, tag);
-	if (V4L2_TYPE_IS_CAPTURE(type)) {
+	if (!joan_trace_quiet && V4L2_TYPE_IS_CAPTURE(type)) {
 		struct v4l2_m2m_buffer *b;
 		unsigned int n = 0;
 
@@ -1672,6 +1762,31 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	}
 	if (!vbuf) {
 		venus_helper_change_dpb_owner(inst, vbuf, type, buf_type, tag);
+		return;
+	}
+	if (joan_dec_clean_stream)
+		to_venus_buffer(vbuf)->joan_submitted = false;
+
+	/*
+	 * A flush returns empty CAPTURE buffers; they are not decoded frames.
+	 * Keep them in the driver while transparent reconfiguration is active.
+	 * Reconfiguration submits the held buffers after FLUSH_DONE. For a late
+	 * empty completion, resubmit only that buffer: submitting the whole dst
+	 * queue here would send buffers which are still owned by firmware twice.
+	 */
+	if (joan_dec_clean_stream && joan_dec_transparent_reconfig &&
+	    V4L2_TYPE_IS_CAPTURE(type) && !bytesused &&
+	    !(hfi_flags & HFI_BUFFERFLAG_EOS) && !inst->joan_dec_stopping) {
+		int ret = 0;
+
+		inst->joan_dec_empty_recycled++;
+		v4l2_m2m_buf_queue(inst->m2m_ctx, vbuf);
+		if (!inst->reconfig)
+			ret = venus_helper_process_one_buf(inst, vbuf);
+		if (ret) {
+			venus_helper_find_buf(inst, type, tag);
+			v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
+		}
 		return;
 	}
 
@@ -1742,6 +1857,51 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		vb2_set_plane_payload(vb, 0, 0);
 		vb->timestamp = 0;
 	}
+
+	/*
+	 * Raw H264 packets without PTS reach V4L2 with timestamp zero. FFmpeg
+	 * copies that zero back to every decoded frame, and the msm8998 encoder
+	 * rejects the next frame with HFI_ERR_SESSION_INVALID_PARAMETER:
+	 * "Venus Encoder: invalid timestamp received!". Repair at CAPTURE so
+	 * FFmpeg also sees progressing PTS before its frame synchronization.
+	 * Keep increasing client timestamps and leave empty EOS untouched.
+	 */
+	if (joan_dec_ts_fallback && V4L2_TYPE_IS_CAPTURE(type) &&
+	    !inst->joan_dec_stopping &&
+	    (!(vbuf->flags & V4L2_BUF_FLAG_LAST) || bytesused)) {
+		u64 original = vb->timestamp;
+		u64 step = div_u64((u64)NSEC_PER_SEC *
+				   inst->timeperframe.numerator,
+				   inst->timeperframe.denominator ?: 30);
+
+		step = max_t(u64, step, NSEC_PER_USEC);
+		if (inst->joan_dec_ts_seen && original <= inst->joan_dec_last_ts) {
+			vb->timestamp = inst->joan_dec_last_ts + step;
+			if (inst->joan_dec_ts_fixups++ < 8)
+				joan_tlog("[dec-ts] id=%#x in=%llu out=%llu step=%llu\n",
+					  inst->id, original, vb->timestamp, step);
+		}
+		inst->joan_dec_last_ts = vb->timestamp;
+		inst->joan_dec_ts_seen = true;
+	}
+
+	if (V4L2_TYPE_IS_CAPTURE(type)) {
+		static unsigned int joan_dump;
+		void *d = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
+
+		if (d && joan_dump < 6) {
+			joan_dump++;
+			joan_tlog("[dump%u] tag=%u used=%u: %02x %02x %02x %02x %02x %02x %02x %02x | @76800 %02x %02x | @98304 %02x %02x | @138240 %02x %02x\n",
+				  joan_dump, tag, bytesused,
+				  ((u8 *)d)[0], ((u8 *)d)[1], ((u8 *)d)[2], ((u8 *)d)[3],
+				  ((u8 *)d)[4], ((u8 *)d)[5], ((u8 *)d)[6], ((u8 *)d)[7],
+				  ((u8 *)d)[76800], ((u8 *)d)[76801],
+				  ((u8 *)d)[98304], ((u8 *)d)[98305],
+				  ((u8 *)d)[138240], ((u8 *)d)[138241]);
+		}
+	}
+	if (V4L2_TYPE_IS_CAPTURE(type) && state == VB2_BUF_STATE_DONE)
+		joan_dec_repack_capture(inst, vbuf, bytesused);
 
 	v4l2_m2m_buf_done(vbuf, state);
 }

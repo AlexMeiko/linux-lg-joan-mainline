@@ -8,6 +8,8 @@
 
 #include <media/videobuf2-v4l2.h>
 
+extern bool joan_dec_clean_stream;
+
 struct venus_inst;
 struct venus_core;
 
