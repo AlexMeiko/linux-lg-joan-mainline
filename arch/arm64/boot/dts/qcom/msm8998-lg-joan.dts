@@ -250,8 +250,11 @@
 &mdss_dsi0 {
 	#address-cells = <1>;
 	#size-cells = <0>;
-	/* Temporary bring-up diagnostic: keep the complete display chain offline. */
-	status = "disabled";
+	/*
+	 * 显示链重新启用（2026-10-28）。此前为 bring-up 诊断整条关闭，
+	 * 现在要验证 SW43402 面板能否出图。
+	 */
+	status = "okay";
 
 	vdd-supply = <&vreg_l1a_0p875>;
 	vdda-supply = <&vreg_l2a_1p2>;
@@ -269,9 +272,16 @@
 		pinctrl-0 = <&panel_active &panel_te_active>;
 		pinctrl-1 = <&panel_suspend &panel_te_suspend>;
 
-		port {
-			panel_in: endpoint {
-				remote-endpoint = <&mdss_dsi0_out>;
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				panel_in: endpoint {
+					remote-endpoint = <&mdss_dsi0_out>;
+				};
 			};
 		};
 	};
@@ -284,17 +294,15 @@
 
 &mdss_dsi0_phy {
 	vdds-supply = <&vreg_l1a_0p875>;
-	status = "disabled";
+	status = "okay";
 };
 
 &mdss {
-	/* Temporary bring-up diagnostic: keep the complete display chain offline. */
-	/delete-property/ iommus;
-	status = "disabled";
+	status = "okay";
 };
 
 &mdss_mdp {
-	status = "disabled";
+	status = "okay";
 };
 
 &mmcc {
@@ -524,28 +532,6 @@
 
 &tlmm {
 	gpio-reserved-ranges = <0 4>, <49 4>, <81 4>;
-
-	/* Keep the bootloader-initialized OLED physically off in headless mode. */
-	panel-reset-hog {
-		gpio-hog;
-		gpios = <35 GPIO_ACTIVE_HIGH>;
-		output-low;
-		line-name = "panel-reset";
-	};
-
-	panel-vddio-hog {
-		gpio-hog;
-		gpios = <92 GPIO_ACTIVE_HIGH>;
-		output-low;
-		line-name = "panel-vddio";
-	};
-
-	panel-vpnl-hog {
-		gpio-hog;
-		gpios = <69 GPIO_ACTIVE_HIGH>;
-		output-low;
-		line-name = "panel-vpnl";
-	};
 
 	panel_active: panel-active-state {
 		pins = "gpio35", "gpio69", "gpio92";

@@ -28,6 +28,7 @@ struct sw43402 {
 	struct drm_dsc_config dsc;
 	int error;
 	bool prepared;
+	bool enabled;
 };
 
 static inline struct sw43402 *to_sw43402(struct drm_panel *panel)
@@ -50,8 +51,11 @@ static void sw43402_dcs_write(struct sw43402 *ctx, const void *data,
 		return;
 
 	ret = mipi_dsi_dcs_write_buffer(ctx->dsi, data, len);
-	if (ret < 0)
+	if (ret < 0) {
+		dev_err(&ctx->dsi->dev, "DCS write failed cmd=0x%02x len=%zu ret=%d\n",
+			((const u8 *)data)[0], len, ret);
 		ctx->error = ret;
+	}
 }
 
 static void sw43402_power_off(struct sw43402 *ctx)
@@ -91,6 +95,8 @@ static int sw43402_on(struct sw43402 *ctx)
 	dsi_dcs_write_seq(ctx, 0x3d, 0x00);
 	dsi_dcs_write_seq(ctx, 0xf2, 0x00);
 	dsi_dcs_write_seq(ctx, 0xff, 0x03, 0x00);
+	/* Match the 1 ms post-command wait in the dv3_1 panel data. */
+	usleep_range(1000, 2000);
 	dsi_dcs_write_seq(ctx, MIPI_DCS_SET_TEAR_ON);
 	if (ctx->error < 0)
 		return ctx->error;
@@ -180,26 +186,57 @@ static int sw43402_off(struct sw43402 *ctx)
 	return 0;
 }
 
+/*
+ * prepare() 早于 DSI host 上电，任何 DCS 命令都会因为
+ * msm_host->power_on == false 而返回 -EINVAL。所以这里只做电源和复位时序，
+ * DCS 初始化放到 enable()。
+ */
 static int sw43402_prepare(struct drm_panel *panel)
 {
 	struct sw43402 *ctx = to_sw43402(panel);
-	struct device *dev = &ctx->dsi->dev;
-	int ret;
 
 	if (ctx->prepared)
 		return 0;
 
 	sw43402_power_on(ctx);
+	ctx->prepared = true;
+	return 0;
+}
+
+static int sw43402_enable(struct drm_panel *panel)
+{
+	struct sw43402 *ctx = to_sw43402(panel);
+	struct device *dev = &ctx->dsi->dev;
+	int ret;
+
+	if (ctx->enabled)
+		return 0;
 
 	ret = sw43402_on(ctx);
 	if (ret < 0) {
 		dev_err(dev, "failed to initialize panel: %d\n", ret);
-		sw43402_power_off(ctx);
 		return ret;
 	}
 
-	ctx->prepared = true;
+	ctx->enabled = true;
 	return 0;
+}
+
+static int sw43402_disable(struct drm_panel *panel)
+{
+	struct sw43402 *ctx = to_sw43402(panel);
+	struct device *dev = &ctx->dsi->dev;
+	int ret;
+
+	if (!ctx->enabled)
+		return 0;
+
+	ret = sw43402_off(ctx);
+	if (ret < 0)
+		dev_err(dev, "failed to turn panel off: %d\n", ret);
+
+	ctx->enabled = false;
+	return ret < 0 ? ret : 0;
 }
 
 static int sw43402_unprepare(struct drm_panel *panel)
@@ -210,10 +247,6 @@ static int sw43402_unprepare(struct drm_panel *panel)
 
 	if (!ctx->prepared)
 		return 0;
-
-	ret = sw43402_off(ctx);
-	if (ret < 0)
-		dev_err(dev, "failed to turn panel off: %d\n", ret);
 
 	sw43402_power_off(ctx);
 	ctx->prepared = false;
@@ -259,6 +292,8 @@ static int sw43402_get_modes(struct drm_panel *panel,
 static const struct drm_panel_funcs sw43402_panel_funcs = {
 	.prepare = sw43402_prepare,
 	.unprepare = sw43402_unprepare,
+	.enable = sw43402_enable,
+	.disable = sw43402_disable,
 	.get_modes = sw43402_get_modes,
 };
 
@@ -325,6 +360,15 @@ static int sw43402_probe(struct mipi_dsi_device *dsi)
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
+	/*
+	 * 视频模式（BURST）。
+	 *
+	 * 试过改成纯命令模式（只留 MIPI_DSI_MODE_LPM）：命令模式下 DPU 依赖
+	 * TE（撕裂）信号推进帧，而 disp-te-gpios 虽然写在 DTS 里，面板驱动
+	 * 从未 request 它，pinctrl 也只把 gpio10 配成 mdp_vsync_a 功能。
+	 * 没有 TE 信号，每次提交都等满 KICKOFF_TIMEOUT_MS=84ms，系统会被拖死。
+	 * 视频模式不依赖 TE，所以恢复成视频模式。
+	 */
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST | MIPI_DSI_MODE_LPM;
 
 	ctx->dsc.dsc_version_major = 1;
@@ -342,6 +386,7 @@ static int sw43402_probe(struct mipi_dsi_device *dsi)
 
 	drm_panel_init(&ctx->panel, dev, &sw43402_panel_funcs,
 		       DRM_MODE_CONNECTOR_DSI);
+	ctx->panel.prepare_prev_first = true;
 
 	ctx->panel.backlight = sw43402_create_backlight(dsi);
 	if (IS_ERR(ctx->panel.backlight))
