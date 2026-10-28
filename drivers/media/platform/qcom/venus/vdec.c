@@ -698,6 +698,54 @@ unlock:
 	return ret;
 }
 
+/*
+ * 解码捕获队列固定使用 non-coherent（缓存）分配，理由见队列初始化处。
+ * 和编码侧一样，不能直接写 q->non_coherent_mem（会和 CREATE_BUFS 的
+ * verify_coherency_flags 冲突），而是在 ioctl 入口补标志。
+ */
+static void vdec_force_non_coherent(struct v4l2_requestbuffers *rb)
+{
+	if (rb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+	    rb->memory == V4L2_MEMORY_MMAP)
+		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+}
+
+static int vdec_ioctl_reqbufs(struct file *file, void *priv,
+			      struct v4l2_requestbuffers *rb)
+{
+	vdec_force_non_coherent(rb);
+	return v4l2_m2m_ioctl_reqbufs(file, priv, rb);
+}
+
+static int vdec_ioctl_create_bufs(struct file *file, void *priv,
+				  struct v4l2_create_buffers *cb)
+{
+	if (cb->format.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+	    cb->memory == V4L2_MEMORY_MMAP)
+		cb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+
+	return v4l2_m2m_ioctl_create_bufs(file, priv, cb);
+}
+
+static void vdec_force_cache_sync(struct v4l2_buffer *b)
+{
+	b->flags &= ~(V4L2_BUF_FLAG_NO_CACHE_INVALIDATE |
+		      V4L2_BUF_FLAG_NO_CACHE_CLEAN);
+}
+
+static int vdec_ioctl_prepare_buf(struct file *file, void *priv,
+				  struct v4l2_buffer *b)
+{
+	vdec_force_cache_sync(b);
+	return v4l2_m2m_ioctl_prepare_buf(file, priv, b);
+}
+
+static int vdec_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *b)
+{
+	vdec_force_cache_sync(b);
+	return v4l2_m2m_ioctl_qbuf(file, priv, b);
+}
+
 static const struct v4l2_ioctl_ops vdec_ioctl_ops = {
 	.vidioc_querycap = vdec_querycap,
 	.vidioc_enum_fmt_vid_cap = vdec_enum_fmt,
@@ -709,11 +757,11 @@ static const struct v4l2_ioctl_ops vdec_ioctl_ops = {
 	.vidioc_try_fmt_vid_cap_mplane = vdec_try_fmt,
 	.vidioc_try_fmt_vid_out_mplane = vdec_try_fmt,
 	.vidioc_g_selection = vdec_g_selection,
-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_reqbufs = vdec_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
-	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
-	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
-	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+	.vidioc_create_bufs = vdec_ioctl_create_bufs,
+	.vidioc_prepare_buf = vdec_ioctl_prepare_buf,
+	.vidioc_qbuf = vdec_ioctl_qbuf,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
@@ -1413,6 +1461,87 @@ done:
 	return ret;
 }
 
+/*
+ * 把 SOURCE_CHANGE 事件从消息线程转交给工作线程。
+ *
+ * 调用者（HFI 消息线程）只按值拷贝事件、调度 worker 就返回，
+ * 绝不能在这里拿 inst->lock —— 那正是原来死锁的成因。
+ * 每次入队都 schedule_work()：work 开始执行时 PENDING 已清除，
+ * 运行期间再入队会重新排队，同一 workqueue 上同一 work 不会并发执行，
+ * 因此不会漏唤醒。
+ */
+static void vdec_queue_seq_event(struct venus_inst *inst,
+				 const struct hfi_event_data *data,
+				 bool sufficient)
+{
+	unsigned long flags;
+	unsigned int tail;
+
+	spin_lock_irqsave(&inst->seq_lock, flags);
+
+	if (inst->seq_closing || !inst->seq_accepting || inst->seq_fault)
+		goto unlock;
+
+	inst->seq_pending = true;
+
+	if (inst->seq_count == VENUS_SEQ_DEPTH) {
+		/*
+		 * 队列满意味着我们跟不上固件。丢掉尺寸/状态转换之后继续用
+		 * 现有缓冲配置没有正确性保证，按会话错误处理，不再入队。
+		 */
+		inst->seq_fault = true;
+		inst->seq_overflows++;
+		dev_err(inst->core->dev_dec,
+			"joan: SOURCE_CHANGE 队列溢出（%llu），按会话错误处理\n",
+			inst->seq_overflows);
+	} else {
+		tail = (inst->seq_head + inst->seq_count) % VENUS_SEQ_DEPTH;
+		inst->seq_fifo[tail].ev = *data;
+		inst->seq_fifo[tail].gen = inst->seq_gen;
+		inst->seq_fifo[tail].sufficient = sufficient;
+		inst->seq_count++;
+	}
+
+	/* 与 closing 检查同处一个临界区，避免 close 取消后生产者又排队 */
+	schedule_work(&inst->seq_event_work);
+
+unlock:
+	spin_unlock_irqrestore(&inst->seq_lock, flags);
+}
+
+/* 作废当前代次并清空队列。调用者必须持 inst->lock。 */
+static void vdec_seq_invalidate_locked(struct venus_inst *inst)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&inst->lock);
+
+	spin_lock_irqsave(&inst->seq_lock, flags);
+	inst->seq_accepting = false;
+	inst->seq_gen++;
+	inst->seq_head = 0;
+	inst->seq_count = 0;
+	inst->seq_pending = false;
+	spin_unlock_irqrestore(&inst->seq_lock, flags);
+}
+
+/* 打开入口并推进代次。调用者必须持 inst->lock。 */
+static void vdec_seq_arm_locked(struct venus_inst *inst)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&inst->lock);
+
+	spin_lock_irqsave(&inst->seq_lock, flags);
+	inst->seq_gen++;
+	inst->seq_head = 0;
+	inst->seq_count = 0;
+	inst->seq_pending = false;
+	inst->seq_fault = false;
+	inst->seq_accepting = true;
+	spin_unlock_irqrestore(&inst->seq_lock, flags);
+}
+
 static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct venus_inst *inst = vb2_get_drv_priv(q);
@@ -1435,9 +1564,19 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	inst->joan_dec_ts_seen = false;
 	inst->joan_dec_ts_fixups = 0;
 	inst->joan_dec_empty_recycled = 0;
+
+	/*
+	 * 输入侧重新开始：推进代次并打开 SOURCE_CHANGE 入口。
+	 * 捕获队列单独重启不动代次（同一路输入流的尺寸事件仍然有效）。
+	 */
+	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+		vdec_seq_arm_locked(inst);
+
 	JOAN_VTRACE("vdec_start_streaming: type=%d count=%u", q->type, count);
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		ret = vdec_start_capture(inst);
+		if (!ret)
+			inst->seq_capture_started = true;
 	} else {
 		ret = vdec_pm_get(inst);
 		if (ret)
@@ -1557,10 +1696,15 @@ static void vdec_stop_streaming(struct vb2_queue *q)
 	mutex_lock(&inst->lock);
 
 	inst->joan_dec_stopping = true;
-	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		/* 捕获侧停止：保留输入代次和事件数据，只是不再自动重配 */
+		inst->seq_capture_started = false;
 		ret = vdec_stop_capture(inst);
-	else
+	} else {
+		/* 输入侧停止：作废代次，旧事件不能再启动重配 */
+		vdec_seq_invalidate_locked(inst);
 		ret = vdec_stop_output(inst);
+	}
 
 	venus_helper_buffers_done(inst, q->type, VB2_BUF_STATE_ERROR);
 
@@ -1864,13 +2008,17 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	v4l2_m2m_buf_done(vbuf, state);
 }
 
-static void joan_reconf_work_fn(struct work_struct *work)
+/*
+ * 重配主体。调用者必须持 inst->lock（见下面的 seq_event_work）。
+ * 原先是独立 work 的 joan_reconf_work_fn；改成 helper 后由事件 worker 直接
+ * 调用，保证"事件 A 的参数更新 + 重配"整体完成之后才处理事件 B。
+ */
+static void joan_reconfigure_locked(struct venus_inst *inst)
 {
-	struct venus_inst *inst = container_of(work, struct venus_inst,
-					      joan_reconf_work);
 	int r;
 
-	mutex_lock(&inst->lock);
+	lockdep_assert_held(&inst->lock);
+
 	r = hfi_session_flush(inst, HFI_FLUSH_OUTPUT, true);
 	if (!r) {
 		r = vdec_reconfigure(inst);
@@ -1889,11 +2037,15 @@ static void joan_reconf_work_fn(struct work_struct *work)
 	} else {
 		JOAN_VTRACE("joan_reconf: flush=%d", r);
 	}
-	mutex_unlock(&inst->lock);
 }
 
-static void vdec_event_change(struct venus_inst *inst,
-			      struct hfi_event_data *ev_data, bool sufficient)
+/*
+ * 应用一次 SOURCE_CHANGE。调用者必须持 inst->lock。
+ * 供 vdec_seq_event_work 调用。
+ */
+static void vdec_event_change_locked(struct venus_inst *inst,
+				     const struct hfi_event_data *ev_data,
+				     bool sufficient)
 {
 	static const struct v4l2_event ev = {
 		.type = V4L2_EVENT_SOURCE_CHANGE,
@@ -1901,7 +2053,7 @@ static void vdec_event_change(struct venus_inst *inst,
 	struct device *dev = inst->core->dev_dec;
 	struct v4l2_format format = {};
 
-	mutex_lock(&inst->lock);
+	lockdep_assert_held(&inst->lock);
 
 	/*
 	 * 事件里 width/height 为 0 时（固件只发 24B 头、没有属性数据），
@@ -1912,7 +2064,6 @@ static void vdec_event_change(struct venus_inst *inst,
 		JOAN_VTRACE("event_change: zero-size event (w=%u h=%u), mark reconfig only",
 			    ev_data->width, ev_data->height);
 		inst->reconfig = true;
-		mutex_unlock(&inst->lock);
 		return;
 	}
 
@@ -2003,9 +2154,8 @@ static void vdec_event_change(struct venus_inst *inst,
 		 * 推 SOURCE_CHANGE，形成事件风暴。
 		 */
 		if (inst->codec_state == VENUS_DEC_STATE_CAPTURE_SETUP)
-			schedule_work(&inst->joan_reconf_work);
+			joan_reconfigure_locked(inst);
 		wake_up(&inst->reconf_wait);
-		mutex_unlock(&inst->lock);
 		return;
 	}
 
@@ -2014,8 +2164,45 @@ static void vdec_event_change(struct venus_inst *inst,
 	v4l2_event_queue_fh(&inst->fh, &ev);
 	JOAN_VTRACE("event_change: 队列后 pending=%d", v4l2_event_pending(&inst->fh));
 	wake_up(&inst->reconf_wait);
+}
 
-	mutex_unlock(&inst->lock);
+/*
+ * 消费 SOURCE_CHANGE 队列。
+ *
+ * 每取一个事件都先拿 inst->lock，再短暂拿 seq_lock，这样不会出现
+ * "worker 已经私藏事件、stop 清空 FIFO 后它才拿到锁" 的生命周期漏洞。
+ */
+static void vdec_seq_event_work(struct work_struct *work)
+{
+	struct venus_inst *inst = container_of(work, struct venus_inst,
+					      seq_event_work);
+
+	for (;;) {
+		struct venus_seq_event ev;
+		unsigned long flags;
+		bool have = false;
+
+		mutex_lock(&inst->lock);
+
+		spin_lock_irqsave(&inst->seq_lock, flags);
+		if (!inst->seq_closing && !inst->seq_fault && inst->seq_count) {
+			ev = inst->seq_fifo[inst->seq_head];
+			inst->seq_head = (inst->seq_head + 1) % VENUS_SEQ_DEPTH;
+			inst->seq_count--;
+			have = (ev.gen == inst->seq_gen);
+			if (!inst->seq_count)
+				inst->seq_pending = false;
+		}
+		spin_unlock_irqrestore(&inst->seq_lock, flags);
+
+		if (!have) {
+			mutex_unlock(&inst->lock);
+			break;
+		}
+
+		vdec_event_change_locked(inst, &ev.ev, ev.sufficient);
+		mutex_unlock(&inst->lock);
+	}
 }
 
 static void vdec_event_notify(struct venus_inst *inst, u32 event,
@@ -2035,10 +2222,10 @@ static void vdec_event_notify(struct venus_inst *inst, u32 event,
 	case EVT_SYS_EVENT_CHANGE:
 		switch (data->event_type) {
 		case HFI_EVENT_DATA_SEQUENCE_CHANGED_SUFFICIENT_BUF_RESOURCES:
-			vdec_event_change(inst, data, true);
+			vdec_queue_seq_event(inst, data, true);
 			break;
 		case HFI_EVENT_DATA_SEQUENCE_CHANGED_INSUFFICIENT_BUF_RESOURCES:
-			vdec_event_change(inst, data, false);
+			vdec_queue_seq_event(inst, data, false);
 			break;
 		case HFI_EVENT_RELEASE_BUFFER_REFERENCE:
 			venus_helper_release_buf_ref(inst, data->tag);
@@ -2113,6 +2300,12 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
 	if (ret)
 		return ret;
 
+	/*
+	 * 解码输出（NV12 帧）是用户态要读的数据。非缓存内存下 CPU 读很慢：
+	 * 4K 转码时解码缓冲 -> 编码缓冲的拷贝会把 4K 转码从 33 fps 拖到 19 fps
+	 * （实测）。开 cache hints 让 vb2 走缓存映射 + 自动 dma_sync。
+	 */
+	dst_vq->allow_cache_hints = 1;
 	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
@@ -2154,7 +2347,16 @@ static int vdec_open(struct file *file)
 	inst->bit_depth = VIDC_BITDEPTH_8;
 	inst->pic_struct = HFI_INTERLACE_FRAME_PROGRESSIVE;
 	init_waitqueue_head(&inst->reconf_wait);
-	INIT_WORK(&inst->joan_reconf_work, joan_reconf_work_fn);
+	spin_lock_init(&inst->seq_lock);
+	INIT_WORK(&inst->seq_event_work, vdec_seq_event_work);
+	inst->seq_accepting = false;
+	inst->seq_closing = false;
+	inst->seq_fault = false;
+	inst->seq_pending = false;
+	inst->seq_capture_started = false;
+	inst->seq_head = 0;
+	inst->seq_count = 0;
+	inst->seq_gen = 0;
 	inst->nonblock = file->f_flags & O_NONBLOCK;
 
 	venus_helper_init_instance(inst);
@@ -2211,16 +2413,45 @@ static int vdec_close(struct file *file)
 	struct venus_inst *inst = to_inst(file);
 
 	vdec_pm_get(inst);
-	cancel_work_sync(&inst->delayed_process_work);
+
 	/*
-	 * joan_reconf_work 会拿 inst->lock 并调用 hfi_session_flush() /
-	 * vdec_reconfigure()。原来 close 只取消了 delayed_process_work，
-	 * 重配工作若还在排队或正在运行，venus_close_common() 释放队列与
-	 * mutex、随后 kfree(inst) 之后它仍会访问 inst —— 典型的 use-after-free。
-	 * 必须在销毁实例之前同步取消。
+	 * 先把所有可能产生工作的入口封住，再取消工作。
+	 * 顺序很重要：先设 closing，让还没进来的回调尽快返回；
+	 * 然后在**不持** inst->lock 的前提下等 IRQ 排空、取消 work，
+	 * 否则 worker 若正等 inst->lock 就会自己卡住自己。
 	 */
-	cancel_work_sync(&inst->joan_reconf_work);
+	mutex_lock(&inst->lock);
+	inst->joan_dec_stopping = true;
+	inst->seq_capture_started = false;
+	mutex_unlock(&inst->lock);
+
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&inst->seq_lock, flags);
+		inst->seq_closing = true;
+		inst->seq_accepting = false;
+		inst->seq_gen++;
+		inst->seq_head = 0;
+		inst->seq_count = 0;
+		inst->seq_pending = false;
+		spin_unlock_irqrestore(&inst->seq_lock, flags);
+	}
+
+	/* 等已经越过 closing 检查的旧回调结束 */
+	synchronize_irq(inst->core->irq);
+
+	cancel_work_sync(&inst->seq_event_work);
+	cancel_work_sync(&inst->delayed_process_work);
+
 	venus_close_common(inst, file);
+
+	/*
+	 * common 已经把实例从 HFI 查找表摘除。再同步一次，等摘除之前
+	 * 已经取到 inst 指针的消息处理者结束，之后才能释放。
+	 */
+	synchronize_irq(inst->core->irq);
+
 	ida_destroy(&inst->dpb_ids);
 	vdec_pm_put(inst, false);
 

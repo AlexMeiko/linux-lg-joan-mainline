@@ -456,9 +456,41 @@ enum venus_inst_modes {
  * @flags:	bitmask flags describing current instance mode
  * @dpb_ids:	DPB buffer ID's
  */
+#define VENUS_SEQ_DEPTH 16
+
+/*
+ * SOURCE_CHANGE 事件的延期处理队列。
+ *
+ * vdec_event_change() 会拿 inst->lock 并（可能）触发重配；重配要同步等
+ * FLUSH_DONE，而 FLUSH_DONE 只能由 HFI 消息线程处理。
+ * 如果消息线程在拿 inst->lock 时被挡住，它就没法继续读包，完成消息永远
+ * 送不到 —— 只能等 1000ms 超时。
+ * 所以消息线程只把事件按值拷进这个 FIFO 就返回，真正的处理在
+ * seq_event_work 里做。
+ */
+struct venus_seq_event {
+	struct hfi_event_data ev;
+	u64 gen;
+	bool sufficient;
+};
+
 struct venus_inst {
-	struct work_struct joan_reconf_work;
 	struct list_head joan_held_caps;
+
+	/* SOURCE_CHANGE 延期队列，seq_lock 保护下列成员 */
+	spinlock_t seq_lock;
+	struct work_struct seq_event_work;
+	struct venus_seq_event seq_fifo[VENUS_SEQ_DEPTH];
+	unsigned int seq_head;
+	unsigned int seq_count;
+	u64 seq_gen;
+	u64 seq_overflows;
+	bool seq_accepting;
+	bool seq_closing;
+	bool seq_fault;
+	bool seq_pending;
+	/* 由 inst->lock 保护 */
+	bool seq_capture_started;
 	bool joan_enc_running;
 	bool joan_cap_ready;
 	u64 joan_dec_last_ts;
