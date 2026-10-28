@@ -198,6 +198,10 @@ struct venus_core {
 	struct clk *vcodec0_clks[VIDC_VCODEC_CLKS_NUM_MAX];
 	struct clk *vcodec1_clks[VIDC_VCODEC_CLKS_NUM_MAX];
 	struct icc_path *video_path;
+	/* load_scale 的频率/带宽缓存：避免每帧重复 clk_set_rate（实测 44us/次） */
+	unsigned long pm_cur_freq;
+	u32 pm_cur_avg_bw;
+	u32 pm_cur_peak_bw;
 	struct icc_path *cpucfg_path;
 	struct dev_pm_domain_list *pmdomains;
 	struct dev_pm_domain_list *opp_pmdomain;
