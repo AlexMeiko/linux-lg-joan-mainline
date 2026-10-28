@@ -14,8 +14,24 @@
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
+#include <linux/gpio/consumer.h>
 
 /* I2C commands */
+#define STMFTS_WRITE_REG			0xb6
+
+/*
+ * FTS3670 (the FingerTipS variant on LG joan) will not drive its interrupt
+ * line until interrupt generation is enabled in its own control register.
+ * Without the write below the controller still answers I2C -- READ_INFO and
+ * the event queue work -- but INT stays idle, so stmfts_command() never sees
+ * its completion and probe dies with -ETIMEDOUT.
+ */
+#define STMFTS_REG_SYSTEM_RESET		0x0028
+#define STMFTS_SYSTEM_RESET_VALUE	0x80
+#define STMFTS_REG_INT_CTRL		0x002c
+#define STMFTS_INT_ENABLE			0x48
+#define STMFTS_INT_DISABLE			0x08
+
 #define STMFTS_READ_INFO			0x80
 #define STMFTS_READ_STATUS			0x84
 #define STMFTS_READ_ONE_EVENT			0x85
@@ -85,6 +101,15 @@ struct stmfts_data {
 	struct regulator_bulk_data regulators[2];
 
 	/*
+	 * Optional hardware reset line. FingerTipS controllers latch their
+	 * I2C address and boot into firmware at the rising edge of reset;
+	 * without at least one pulse after power-on they never answer the
+	 * command protocol (SYSTEM_RESET + SLEEP_OUT), so the completion in
+	 * stmfts_command() times out with -ETIMEDOUT.
+	 */
+	struct gpio_desc *reset_gpio;
+
+	/*
 	 * Presence of ledvdd will be used also to check
 	 * whether the LED is supported.
 	 */
@@ -143,9 +168,16 @@ static enum led_brightness stmfts_brightness_get(struct led_classdev *led_cdev)
  * We can't simply use i2c_smbus_read_i2c_block_data because we
  * need to read more than 255 bytes (
  */
-static int stmfts_read_events(struct stmfts_data *sdata)
+/*
+ * Plain register read over raw I2C.
+ *
+ * The i2c-qup adapter on msm8998 does not advertise
+ * I2C_FUNC_SMBUS_I2C_BLOCK_DATA, so i2c_smbus_read_i2c_block_data() bails
+ * out with -EOPNOTSUPP before anything reaches the wire. Issue the same
+ * two-message transfer stmfts_read_events() already uses instead.
+ */
+static int stmfts_reg_read(struct stmfts_data *sdata, u8 cmd, u8 *buf, int len)
 {
-	u8 cmd = STMFTS_READ_ALL_EVENT;
 	struct i2c_msg msgs[2] = {
 		{
 			.addr	= sdata->client->addr,
@@ -155,8 +187,8 @@ static int stmfts_read_events(struct stmfts_data *sdata)
 		{
 			.addr	= sdata->client->addr,
 			.flags	= I2C_M_RD,
-			.len	= STMFTS_DATA_MAX_SIZE,
-			.buf	= sdata->data,
+			.len	= len,
+			.buf	= buf,
 		},
 	};
 	int ret;
@@ -165,15 +197,122 @@ static int stmfts_read_events(struct stmfts_data *sdata)
 	if (ret < 0)
 		return ret;
 
-	return ret == ARRAY_SIZE(msgs) ? 0 : -EIO;
+	return ret == ARRAY_SIZE(msgs) ? len : -EIO;
+}
+
+/*
+ * One-byte command write that does not wait for a completion event.
+ * stmfts_command() blocks on cmd_done, which the FTS3670 only raises after
+ * its interrupt output has been enabled -- so during bringup these commands
+ * have to be fire-and-forget.
+ */
+static int stmfts_write_byte(struct stmfts_data *sdata, u8 cmd)
+{
+	struct i2c_msg msg = {
+		.addr	= sdata->client->addr,
+		.len	= 1,
+		.buf	= &cmd,
+	};
+	int ret;
+
+	ret = i2c_transfer(sdata->client->adapter, &msg, 1);
+	if (ret < 0)
+		return ret;
+
+	return ret == 1 ? 0 : -EIO;
+}
+
+/*
+ * 16-bit register write: 0xb6 followed by address high/low and the value.
+ * Must use the raw transfer API for the same reason stmfts_reg_read() does.
+ */
+static int stmfts_reg_write(struct stmfts_data *sdata, u16 reg, u8 val)
+{
+	u8 frame[4] = { STMFTS_WRITE_REG, reg >> 8, reg & 0xff, val };
+	struct i2c_msg msg = {
+		.addr	= sdata->client->addr,
+		.len	= sizeof(frame),
+		.buf	= frame,
+	};
+	int ret;
+
+	ret = i2c_transfer(sdata->client->adapter, &msg, 1);
+	if (ret < 0)
+		return ret;
+
+	return ret == 1 ? 0 : -EIO;
+}
+
+/*
+ * Drain the event FIFO one event at a time.
+ *
+ * The upstream driver issues a single READ_ALL_EVENT transfer of
+ * STMFTS_DATA_MAX_SIZE (256) bytes, which assumes the controller returns a
+ * packed array. On this FTS3670 that transfer reads back all zeroes even
+ * while READ_ONE_EVENT is returning real contacts a moment later, so the
+ * batch command cannot be relied on here.
+ *
+ * Loop over READ_ONE_EVENT instead, stopping at the first empty event. The
+ * whole FIFO is consumed, so the controller has a chance to release its
+ * interrupt line, and the caller's parse step sees the events individually.
+ */
+static int stmfts_read_events(struct stmfts_data *sdata)
+{
+	int slot;
+	int ret;
+
+	for (slot = 0; slot < STMFTS_STACK_DEPTH; slot++) {
+		u8 cmd = STMFTS_READ_ONE_EVENT;
+		u8 *buf = &sdata->data[slot * STMFTS_EVENT_SIZE];
+		struct i2c_msg msgs[2] = {
+			{
+				.addr	= sdata->client->addr,
+				.len	= 1,
+				.buf	= &cmd,
+			},
+			{
+				.addr	= sdata->client->addr,
+				.flags	= I2C_M_RD,
+				.len	= STMFTS_EVENT_SIZE,
+				.buf	= buf,
+			},
+		};
+
+		ret = i2c_transfer(sdata->client->adapter, msgs,
+				   ARRAY_SIZE(msgs));
+		if (ret < 0)
+			return ret;
+		if (ret != ARRAY_SIZE(msgs))
+			return -EIO;
+
+		/* Empty slot marks the end of the queued events. */
+		if (!buf[0])
+			break;
+	}
+
+	return 0;
 }
 
 static void stmfts_report_contact_event(struct stmfts_data *sdata,
 					const u8 event[])
 {
 	u8 slot_id = (event[0] & STMFTS_MASK_TOUCH_ID) >> 4;
-	u16 x = event[1] | ((event[2] & STMFTS_MASK_X_MSB) << 8);
-	u16 y = (event[2] >> 4) | (event[3] << 4);
+
+	/*
+	 * FTS3670 contact layout: each axis is split across a full byte of its
+	 * own plus one nibble of the shared byte 3.
+	 *
+	 *	x = (event[1] << 4) | (event[3] >> 4)
+	 *	y = (event[2] << 4) | (event[3] & 0x0f)
+	 *
+	 * Derived from a four-corner capture on the 1440x2880 joan panel; every
+	 * sample in that set lands inside the panel and varies smoothly along
+	 * the swipe. The upstream split (x from bytes 1/2, y from bytes 2/3)
+	 * yields x > 3915 on the same data, i.e. it describes a different
+	 * FingerTipS variant.
+	 */
+	u16 x = (event[1] << 4) | (event[3] >> 4);
+	u16 y = (event[2] << 4) | (event[3] & 0x0f);
 	u8 maj = event[4];
 	u8 min = event[5];
 	u8 orientation = event[6];
@@ -188,8 +327,6 @@ static void stmfts_report_contact_event(struct stmfts_data *sdata,
 	input_report_abs(sdata->input, ABS_MT_TOUCH_MINOR, min);
 	input_report_abs(sdata->input, ABS_MT_PRESSURE, area);
 	input_report_abs(sdata->input, ABS_MT_ORIENTATION, orientation);
-
-	input_sync(sdata->input);
 }
 
 static void stmfts_report_contact_release(struct stmfts_data *sdata,
@@ -199,8 +336,6 @@ static void stmfts_report_contact_release(struct stmfts_data *sdata,
 
 	input_mt_slot(sdata->input, slot_id);
 	input_mt_report_slot_inactive(sdata->input);
-
-	input_sync(sdata->input);
 }
 
 static void stmfts_report_hover_event(struct stmfts_data *sdata,
@@ -213,8 +348,6 @@ static void stmfts_report_hover_event(struct stmfts_data *sdata,
 	input_report_abs(sdata->input, ABS_X, x);
 	input_report_abs(sdata->input, ABS_Y, y);
 	input_report_abs(sdata->input, ABS_DISTANCE, z);
-
-	input_sync(sdata->input);
 }
 
 static void stmfts_report_key_event(struct stmfts_data *sdata, const u8 event[])
@@ -239,7 +372,6 @@ static void stmfts_report_key_event(struct stmfts_data *sdata, const u8 event[])
 		break;
 	}
 
-	input_sync(sdata->input);
 }
 
 static void stmfts_parse_events(struct stmfts_data *sdata)
@@ -255,10 +387,21 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 		case STMFTS_EV_SLEEP_OUT_CONTROLLER_READY:
 		case STMFTS_EV_STATUS:
 			complete(&sdata->cmd_done);
-			fallthrough;
+			/*
+			 * Only this event is done with -- keep walking the rest
+			 * of the batch. Returning here used to drop every event
+			 * that followed a status report, which loses contacts
+			 * whenever the controller interleaves 0x16 with touch
+			 * data (it does so routinely).
+			 */
+			continue;
 
 		case STMFTS_EV_NO_EVENT:
 		case STMFTS_EV_DEBUG:
+			/*
+			 * An empty slot marks the end of the queued events;
+			 * stmfts_read_events() stops there as well.
+			 */
 			return;
 		}
 
@@ -295,6 +438,17 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 				"unknown event %#02x\n", event[0]);
 		}
 	}
+
+	/*
+	 * One report per drained batch, not one per event.
+	 *
+	 * The controller queues all contacts of a frame together, but syncing
+	 * inside every report function turned a three-finger frame into three
+	 * consecutive single-finger frames -- userspace then sees fingers
+	 * arriving one at a time instead of together, which breaks pinch and
+	 * multi-finger gestures.
+	 */
+	input_sync(sdata->input);
 }
 
 static irqreturn_t stmfts_irq_handler(int irq, void *dev)
@@ -452,9 +606,9 @@ static ssize_t stmfts_sysfs_read_status(struct device *dev,
 	u8 status[4];
 	int err;
 
-	err = i2c_smbus_read_i2c_block_data(sdata->client, STMFTS_READ_STATUS,
-					    sizeof(status), status);
-	if (err)
+	err = stmfts_reg_read(sdata, STMFTS_READ_STATUS, status,
+			      sizeof(status));
+	if (err < 0)
 		return err;
 
 	return sprintf(buf, "%#02x\n", status[0]);
@@ -529,14 +683,20 @@ static int stmfts_power_on(struct stmfts_data *sdata)
 	if (err)
 		return err;
 
+	if (sdata->reset_gpio) {
+		gpiod_set_value_cansleep(sdata->reset_gpio, 1);
+		usleep_range(1000, 2000);
+		gpiod_set_value_cansleep(sdata->reset_gpio, 0);
+		usleep_range(9000, 10000);
+	}
+
 	/*
 	 * The datasheet does not specify the power on time, but considering
 	 * that the reset time is < 10ms, I sleep 20ms to be sure
 	 */
 	msleep(20);
 
-	err = i2c_smbus_read_i2c_block_data(sdata->client, STMFTS_READ_INFO,
-					    sizeof(reg), reg);
+	err = stmfts_reg_read(sdata, STMFTS_READ_INFO, reg, sizeof(reg));
 	if (err < 0)
 		return err;
 	if (err != sizeof(reg))
@@ -547,34 +707,60 @@ static int stmfts_power_on(struct stmfts_data *sdata)
 	sdata->fw_ver = be16_to_cpup((__be16 *)&reg[2]);
 	sdata->config_id = reg[4];
 	sdata->config_ver = reg[5];
+	/*
+	 * MINIMAL BRINGUP (experiment): FTS3670 never raises the completion
+	 * event that stmfts_command() waits on, so skip that path entirely and
+	 * drive the controller through its register interface plus the plain
+	 * one-byte command set.
+	 *
+	 * Reset: register 0x0028 = 0x80.
+	 */
+	err = stmfts_reg_write(sdata, STMFTS_REG_SYSTEM_RESET,
+			       STMFTS_SYSTEM_RESET_VALUE);
+	if (err) {
+		dev_err(&sdata->client->dev, "failed to reset controller: %d\n", err);
+		return err;
+	}
+	msleep(100);
 
-	enable_irq(sdata->client->irq);
+	err = stmfts_reg_write(sdata, STMFTS_REG_INT_CTRL, STMFTS_INT_DISABLE);
+	if (err) {
+		dev_err(&sdata->client->dev, "failed to mask interrupts: %d\n", err);
+		return err;
+	}
 
+	/* Flush whatever the controller queued during its own boot. */
+	stmfts_write_byte(sdata, 0x92 /* SENSE_OFF */);
+	msleep(50);
+	stmfts_write_byte(sdata, 0xa1 /* FLUSH_BUFFER */);
+	msleep(50);
+	stmfts_write_byte(sdata, 0xaa /* RELEASE_INFO */);
 	msleep(50);
 
-	err = stmfts_command(sdata, STMFTS_SYSTEM_RESET);
-	if (err)
+	/* Drain the FIFO so no stale event races the first real IRQ. */
+	{
+		u8 ev[STMFTS_EVENT_SIZE];
+		int i;
+
+		for (i = 0; i < 50; i++) {
+			if (stmfts_read_events(sdata) < 0)
+				break;
+			memcpy(ev, sdata->data, sizeof(ev));
+			if (!ev[0])
+				break;
+			msleep(10);
+		}
+	}
+
+	/* Start scanning, then let the controller drive the interrupt line. */
+	stmfts_write_byte(sdata, 0x93 /* SENSE_ON */);
+	err = stmfts_reg_write(sdata, STMFTS_REG_INT_CTRL, STMFTS_INT_ENABLE);
+	if (err) {
+		dev_err(&sdata->client->dev, "failed to enable interrupts: %d\n", err);
 		return err;
-
-	err = stmfts_command(sdata, STMFTS_SLEEP_OUT);
-	if (err)
-		return err;
-
-	/* optional tuning */
-	err = stmfts_command(sdata, STMFTS_MS_CX_TUNING);
-	if (err)
-		dev_warn(&sdata->client->dev,
-			 "failed to perform mutual auto tune: %d\n", err);
-
-	/* optional tuning */
-	err = stmfts_command(sdata, STMFTS_SS_CX_TUNING);
-	if (err)
-		dev_warn(&sdata->client->dev,
-			 "failed to perform self auto tune: %d\n", err);
-
-	err = stmfts_command(sdata, STMFTS_FULL_FORCE_CALIBRATION);
-	if (err)
-		return err;
+	}
+	enable_irq(sdata->client->irq);
+	msleep(50);
 
 	/*
 	 * At this point no one is using the touchscreen
@@ -590,6 +776,9 @@ static void stmfts_power_off(void *data)
 	struct stmfts_data *sdata = data;
 
 	disable_irq(sdata->client->irq);
+	/* Mask the controller's own interrupt source as well, so it does not
+	 * keep the line asserted across a power cycle. */
+	stmfts_reg_write(sdata, STMFTS_REG_INT_CTRL, STMFTS_INT_DISABLE);
 	regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
 						sdata->regulators);
 }
@@ -640,6 +829,11 @@ static int stmfts_probe(struct i2c_client *client)
 	sdata->client = client;
 	mutex_init(&sdata->mutex);
 	init_completion(&sdata->cmd_done);
+
+	sdata->reset_gpio = devm_gpiod_get_optional(&client->dev, "reset",
+						    GPIOD_OUT_LOW);
+	if (IS_ERR(sdata->reset_gpio))
+		return PTR_ERR(sdata->reset_gpio);
 
 	sdata->regulators[STMFTS_REGULATOR_VDD].supply = "vdd";
 	sdata->regulators[STMFTS_REGULATOR_AVDD].supply = "avdd";

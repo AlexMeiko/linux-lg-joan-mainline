@@ -547,6 +547,21 @@
 		bias-pull-down;
 	};
 
+	/* 触摸：中断（gpio125，低有效）与复位（gpio89，低有效） */
+	touch_int_default: touch-int-default-state {
+		pins = "gpio125";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	touch_reset_default: touch-reset-default-state {
+		pins = "gpio89";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
 	panel_te_active: panel-te-active-state {
 		pins = "gpio10";
 		function = "mdp_vsync_a";
@@ -632,4 +647,63 @@
 	vdd-1.8-xo-supply = <&vreg_l7a_1p8>;
 	vdd-1.3-rfa-supply = <&vreg_l17a_1p3>;
 	vdd-3.3-ch0-supply = <&vreg_l25a_3p3>;
+};
+
+/*
+ * 触摸第 2 步（2026-10-28）：加上供电与触摸节点。
+ *
+ * 第 1 步已经实测：只启用 I2C5 时总线上扫不到任何设备；
+ * 用 GPIO 拉起 TLMM 85 / 86 后，0x49 立刻有 ACK。
+ * 所以这两个 GPIO 是触摸芯片的电源开关，必须由 DTS 描述成 regulator。
+ *
+ * 芯片：STMicro FingerTipS FTS3670
+ *   总线  ：BLSP1 QUP5（i2c-0），地址 0x49
+ *   中断  ：TLMM 125，低有效
+ *   复位  ：TLMM 89，低有效
+ *   avdd  ：TLMM 85（3.3V 负载开关）
+ *   vdd   ：TLMM 86（1.8V 负载开关）
+ */
+
+/ {
+	vreg_touch_avdd: regulator-touch-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_avdd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tlmm 85 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	vreg_touch_vdd: regulator-touch-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_vdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&tlmm 86 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&blsp1_i2c5 {
+	status = "okay";
+
+	touchscreen@49 {
+		/* 先用主线上游的 compatible，看驱动能 probe 到哪一步 */
+		compatible = "st,stmfts";
+		reg = <0x49>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <125 IRQ_TYPE_LEVEL_LOW>;
+
+		vdd-supply = <&vreg_touch_vdd>;
+		avdd-supply = <&vreg_touch_avdd>;
+
+		reset-gpios = <&tlmm 89 GPIO_ACTIVE_LOW>;
+
+		touchscreen-size-x = <1440>;
+		touchscreen-size-y = <2880>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&touch_int_default &touch_reset_default>;
+	};
 };
