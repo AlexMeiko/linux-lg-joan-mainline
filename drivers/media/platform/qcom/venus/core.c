@@ -36,10 +36,16 @@ unsigned int joan_no_recover;
 #include "pm_helpers.h"
 #include "hfi_venus_io.h"
 
+void joan_tlog(const char *fmt, ...);
+
 #ifndef JOAN_VTRACE
-#define JOAN_VTRACE(fmt, ...) do { \
-	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
-} while (0)
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
 #endif
 
 

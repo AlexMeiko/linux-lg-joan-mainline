@@ -5,10 +5,16 @@
  */
 #include <linux/hash.h>
 
+extern unsigned int joan_trace_quiet;
+
 #ifndef JOAN_VTRACE
-#define JOAN_VTRACE(fmt, ...) do { \
-	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
-} while (0)
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
 #endif
 #include <linux/list.h>
 #include <linux/slab.h>
@@ -569,7 +575,8 @@ static void hfi_session_etb_done(struct venus_core *core,
 		schedule_work(&inst->joan_rec_work);
 		joan_tlog("[rec] 首个 0x1002，安排会话重建\n");
 	}
-	JOAN_VTRACE("etb_done: sess=%u tag=%u filled=%u err=%u",
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("etb_done: sess=%u tag=%u filled=%u err=%u",
 		    inst->session_type, pkt->input_tag, pkt->filled_len,
 		    pkt->error_type);
 	inst->ops->buf_done(inst, HFI_BUFFER_INPUT, pkt->input_tag,
@@ -587,7 +594,8 @@ static void hfi_session_ftb_done(struct venus_core *core,
 	u32 pic_type = 0, buffer_type = 0, output_tag = -1;
 	const u32 *__raw = packet;
 
-	JOAN_VTRACE("ftb_raw: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("ftb_raw: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
 		    __raw[0], __raw[1], __raw[2], __raw[3], __raw[4], __raw[5],
 		    __raw[6], __raw[7], __raw[8], __raw[9], __raw[10], __raw[11],
 		    __raw[12], __raw[13], __raw[14], __raw[15], __raw[16], __raw[17],
@@ -661,7 +669,8 @@ static void hfi_session_ftb_done(struct venus_core *core,
 
 done:
 	inst->error = error;
-	JOAN_VTRACE("ftb_done: sess=%u btype=%u tag=%u filled=%u err=%u hfi_flags=%#x pic=%#x v4l2_flags=%#x",
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("ftb_done: sess=%u btype=%u tag=%u filled=%u err=%u hfi_flags=%#x pic=%#x v4l2_flags=%#x",
 		    session_type, buffer_type, output_tag, filled_len, error,
 		    hfi_flags, pic_type, flags);
 	inst->ops->buf_done(inst, buffer_type, output_tag, filled_len,
@@ -867,7 +876,8 @@ u32 hfi_process_msg_packet(struct venus_core *core, struct hfi_pkt_hdr *hdr)
 		break;
 	}
 
-	JOAN_VTRACE("msg: pkt_type=%#x size=%u found=%d", hdr->pkt_type, hdr->size, found);
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("msg: pkt_type=%#x size=%u found=%d", hdr->pkt_type, hdr->size, found);
 
 	if (!found)
 		return hdr->pkt_type;

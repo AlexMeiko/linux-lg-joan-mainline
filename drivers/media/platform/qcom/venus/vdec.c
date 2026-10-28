@@ -5,10 +5,17 @@
  */
 #include <linux/clk.h>
 
+extern atomic_t joan_sync_timeouts;
+extern atomic_t joan_sync_errors;
+
 #ifndef JOAN_VTRACE
-#define JOAN_VTRACE(fmt, ...) do { \
-	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
-} while (0)
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
 #endif
 #include <linux/module.h>
 #include <linux/math64.h>
@@ -1556,6 +1563,17 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
 	int ret;
 
 	mutex_lock(&inst->lock);
+
+	/*
+	 * 同步命令（LOAD_RES/OUTPUT_CONF/START/FLUSH...）共用 inst->done，
+	 * 任何一次超时或错误都说明完成信号被串了。健康时保持零输出，
+	 * 只在异常时打到 dmesg，避免又是一条每流一次的噪音。
+	 */
+	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
+	    (atomic_read(&joan_sync_timeouts) || atomic_read(&joan_sync_errors)))
+		pr_err("joan-sync: 同步命令超时=%d 错误=%d\n",
+		       atomic_read(&joan_sync_timeouts),
+		       atomic_read(&joan_sync_errors));
 
 	inst->joan_dec_stopping = false;
 	/*
