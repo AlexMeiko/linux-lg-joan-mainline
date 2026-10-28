@@ -131,7 +131,8 @@ fill_caps(struct hfi_plat_caps *cap, const void *data, unsigned int num)
 }
 
 static int
-parse_caps(struct venus_core *core, u32 codecs, u32 domain, void *data)
+parse_caps(struct venus_core *core, u32 codecs, u32 domain, void *data,
+	   u32 rem)
 {
 	struct hfi_capabilities *caps = data;
 	struct hfi_capability *cap = caps->data;
@@ -139,6 +140,14 @@ parse_caps(struct venus_core *core, u32 codecs, u32 domain, void *data)
 	struct hfi_capability caps_arr[MAX_CAP_ENTRIES] = {};
 
 	if (num_caps > MAX_CAP_ENTRIES)
+		return -EINVAL;
+
+	/*
+	 * num_caps 来自固件包，MAX_CAP_ENTRIES 只是本地数组上限，
+	 * 并不保证包里真的带着这么多项。截断的包会让下面的 memcpy
+	 * 读过包尾 —— 必须按剩余字节数再校验一次。
+	 */
+	if (sizeof(*caps) + num_caps * sizeof(*cap) > rem)
 		return -EINVAL;
 
 	memcpy(caps_arr, cap, num_caps * sizeof(*cap));
@@ -162,7 +171,8 @@ static void fill_raw_fmts(struct hfi_plat_caps *cap, const void *fmts,
 }
 
 static int
-parse_raw_formats(struct venus_core *core, u32 codecs, u32 domain, void *data)
+parse_raw_formats(struct venus_core *core, u32 codecs, u32 domain, void *data,
+		  u32 rem)
 {
 	struct hfi_uncompressed_format_supported *fmt = data;
 	struct hfi_uncompressed_plane_info *pinfo = &fmt->plane_info;
@@ -171,6 +181,7 @@ parse_raw_formats(struct venus_core *core, u32 codecs, u32 domain, void *data)
 	u32 entries = fmt->format_entries;
 	unsigned int i = 0;
 	u32 num_planes = 0;
+	u32 consumed = sizeof(*fmt);
 	u32 size;
 
 	while (entries) {
@@ -185,6 +196,14 @@ parse_raw_formats(struct venus_core *core, u32 codecs, u32 domain, void *data)
 
 		if (pinfo->num_planes > MAX_PLANES)
 			break;
+
+		/*
+		 * entries / num_planes 都来自固件包。逐项按已消费字节数校验，
+		 * 避免截断的包让 pinfo 走出包尾。
+		 */
+		if (consumed + num_planes * sizeof(*constr) > rem)
+			return -EINVAL;
+		consumed += num_planes * sizeof(*constr) + 2 * sizeof(u32);
 
 		pinfo = (void *)pinfo + sizeof(*constr) * num_planes +
 			2 * sizeof(u32);
@@ -346,13 +365,30 @@ u32 hfi_parser(struct venus_core *core, struct venus_inst *inst, void *buf,
 			if (rem_bytes <= sizeof(struct hfi_uncompressed_format_supported))
 				return HFI_ERR_SYS_INSUFFICIENT_RESOURCES;
 
-			ret = parse_raw_formats(core, codecs, domain, payload);
+			ret = parse_raw_formats(core, codecs, domain, payload,
+						rem_bytes);
 			break;
 		case HFI_PROPERTY_PARAM_CAPABILITY_SUPPORTED:
 			if (rem_bytes <= sizeof(struct hfi_capabilities))
 				return HFI_ERR_SYS_INSUFFICIENT_RESOURCES;
 
-			ret = parse_caps(core, codecs, domain, payload);
+			/*
+			 * 变异自测：用**真实固件包**验证边界校验确实生效 ——
+			 * 把剩余长度截到只剩计数字段，解析必须被拒绝。
+			 * 只在有 capability 项时跑，每个 caps 包一次，开销可忽略。
+			 */
+			{
+				struct hfi_capabilities *c = (void *)payload;
+
+				if (c->num_capabilities &&
+				    parse_caps(core, codecs, domain, payload,
+					       sizeof(struct hfi_capabilities)) != -EINVAL)
+					pr_err("joan: parse_caps 边界校验未生效！\n");
+				else if (c->num_capabilities)
+					pr_info("joan-selftest: parse_caps 截断包被正确拒绝\n");
+			}
+
+			ret = parse_caps(core, codecs, domain, payload, rem_bytes);
 			break;
 		case HFI_PROPERTY_PARAM_PROFILE_LEVEL_SUPPORTED:
 			if (rem_bytes <= sizeof(struct hfi_profile_level_supported))
