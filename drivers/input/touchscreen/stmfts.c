@@ -381,6 +381,16 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 	for (i = 0; i < STMFTS_STACK_DEPTH; i++) {
 		u8 *event = &sdata->data[i * STMFTS_EVENT_SIZE];
 
+		/*
+		 * An empty slot marks the end of the drained batch, and a
+		 * debug event carries nothing to report. Leave the loop here
+		 * rather than returning: the input_sync() below still has to
+		 * run, otherwise the contacts collected so far never reach
+		 * userspace.
+		 */
+		if (!event[0] || event[0] == STMFTS_EV_DEBUG)
+			break;
+
 		switch (event[0]) {
 
 		case STMFTS_EV_CONTROLLER_READY:
@@ -390,19 +400,9 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 			/*
 			 * Only this event is done with -- keep walking the rest
 			 * of the batch. Returning here used to drop every event
-			 * that followed a status report, which loses contacts
-			 * whenever the controller interleaves 0x16 with touch
-			 * data (it does so routinely).
+			 * that followed a status report.
 			 */
 			continue;
-
-		case STMFTS_EV_NO_EVENT:
-		case STMFTS_EV_DEBUG:
-			/*
-			 * An empty slot marks the end of the queued events;
-			 * stmfts_read_events() stops there as well.
-			 */
-			return;
 		}
 
 		switch (event[0] & STMFTS_MASK_EVENT_ID) {
@@ -427,10 +427,17 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
 			break;
 
 		case STMFTS_EV_ERROR:
-			dev_warn(&sdata->client->dev,
-					"error code: 0x%x%x%x%x%x%x",
-					event[6], event[5], event[4],
-					event[3], event[2], event[1]);
+			/*
+			 * Not necessarily a fault: this FTS3670 reports the same
+			 * event id for its SLEEP_IN acknowledgement, which
+			 * stmfts_power_on() triggers on every cycle. Keep it at
+			 * debug level so the warning does not fire on a healthy
+			 * controller.
+			 */
+			dev_dbg(&sdata->client->dev,
+				"event 0x0f: 0x%02x%02x%02x%02x%02x%02x\n",
+				event[6], event[5], event[4],
+				event[3], event[2], event[1]);
 			break;
 
 		default:
@@ -707,14 +714,7 @@ static int stmfts_power_on(struct stmfts_data *sdata)
 	sdata->fw_ver = be16_to_cpup((__be16 *)&reg[2]);
 	sdata->config_id = reg[4];
 	sdata->config_ver = reg[5];
-	/*
-	 * MINIMAL BRINGUP (experiment): FTS3670 never raises the completion
-	 * event that stmfts_command() waits on, so skip that path entirely and
-	 * drive the controller through its register interface plus the plain
-	 * one-byte command set.
-	 *
-	 * Reset: register 0x0028 = 0x80.
-	 */
+
 	err = stmfts_reg_write(sdata, STMFTS_REG_SYSTEM_RESET,
 			       STMFTS_SYSTEM_RESET_VALUE);
 	if (err) {
@@ -738,18 +738,15 @@ static int stmfts_power_on(struct stmfts_data *sdata)
 	msleep(50);
 
 	/* Drain the FIFO so no stale event races the first real IRQ. */
-	{
+	for (int i = 0; i < 50; i++) {
 		u8 ev[STMFTS_EVENT_SIZE];
-		int i;
 
-		for (i = 0; i < 50; i++) {
-			if (stmfts_read_events(sdata) < 0)
-				break;
-			memcpy(ev, sdata->data, sizeof(ev));
-			if (!ev[0])
-				break;
-			msleep(10);
-		}
+		if (stmfts_read_events(sdata) < 0)
+			break;
+		memcpy(ev, sdata->data, sizeof(ev));
+		if (!ev[0])
+			break;
+		msleep(10);
 	}
 
 	/* Start scanning, then let the controller drive the interrupt line. */
@@ -759,6 +756,7 @@ static int stmfts_power_on(struct stmfts_data *sdata)
 		dev_err(&sdata->client->dev, "failed to enable interrupts: %d\n", err);
 		return err;
 	}
+
 	enable_irq(sdata->client->irq);
 	msleep(50);
 
