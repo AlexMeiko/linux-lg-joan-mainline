@@ -222,6 +222,7 @@ struct venus_core {
 		size_t mem_size;
 	} fw;
 	struct mutex lock;
+	u32 next_session_id;
 	struct mutex joan_warm_lock;
 	struct venus_inst *joan_warm_enc;
 	struct list_head instances;

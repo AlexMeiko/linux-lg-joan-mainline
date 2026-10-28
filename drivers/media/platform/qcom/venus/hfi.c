@@ -350,8 +350,29 @@ static int hfi_session_init_direct(struct venus_inst *inst, u32 pixfmt)
 	if (inst->state != INST_UNINIT)
 		return -EALREADY;
 
-	if (!inst->id)
-		inst->id = hash32_ptr(inst);
+	if (!inst->id) {
+		struct venus_inst *other;
+		u32 id;
+
+		/*
+		 * 原来用 hash32_ptr(inst)。实例是 kzalloc 出来的，关闭后
+		 * 同一 slab 槽位很容易被下一个实例复用，哈希值也就跟着重复；
+		 * 迟到的旧会话消息会被路由到新实例上。
+		 * 改成每 core 单调递增的编号，并跳过已被占用的值。
+		 */
+		mutex_lock(&core->lock);
+		do {
+			id = ++core->next_session_id;
+			if (!id)
+				id = ++core->next_session_id;
+			list_for_each_entry(other, &core->instances, list)
+				if (other->id == id)
+					break;
+		} while (!list_entry_is_head(other, &core->instances, list));
+		core->next_session_id = id;
+		inst->id = id;
+		mutex_unlock(&core->lock);
+	}
 
 	inst->hfi_codec = to_codec_type(pixfmt);
 	reinit_completion(&inst->done);
