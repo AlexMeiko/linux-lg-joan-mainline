@@ -241,6 +241,18 @@ static void hfi_event_notify(struct venus_core *core, struct venus_inst *inst,
 	JOAN_VTRACE("event_notify: id=%#x data1=%#x data2=%#x",
 		    pkt->event_id, pkt->event_data1, pkt->event_data2);
 
+	/*
+	 * 上面的分发表对 EVENT_NOTIFY 在 instance 无效时是放行的
+	 * （SYS_ERROR 本来就没有会话）。但 SESSION_ERROR /
+	 * SESSION_SEQUENCE_CHANGED / RELEASE_BUFFER_REFERENCE 都是会话级事件，
+	 * 处理器会解引用 inst —— 传 NULL 就是空指针解引用。
+	 */
+	if (!inst && pkt->event_id != HFI_EVENT_SYS_ERROR) {
+		dev_warn(core->dev, "joan: 会话级事件 %#x 但 instance 无效，丢弃\n",
+			 pkt->event_id);
+		return;
+	}
+
 	switch (pkt->event_id) {
 	case HFI_EVENT_SYS_ERROR:
 		event_sys_error(core, EVT_SYS_ERROR, pkt);
