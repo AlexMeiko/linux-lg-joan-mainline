@@ -2172,6 +2172,22 @@ static void vdec_event_change_locked(struct venus_inst *inst,
 	inst->next_buf_last = true;
 	inst->reconfig = true;
 
+	/*
+	 * 透明重配会复用已经分配好的捕获缓冲。如果新分辨率需要更大的缓冲，
+	 * 复用就等于让固件往小缓冲里写整帧 —— 必须改走标准流程：
+	 * 把 SOURCE_CHANGE 事件发给用户态，由它重新协商格式并重新分配。
+	 */
+	{
+		u32 need = venus_helper_get_framesz(inst->fmt_cap->pixfmt,
+						    inst->width, inst->height);
+
+		if (inst->output_buf_size && need > inst->output_buf_size) {
+			JOAN_VTRACE("event_change: 新尺寸需要 %u 字节 > 已分配 %u，改走事件路径",
+				    need, inst->output_buf_size);
+			goto queue_event;
+		}
+	}
+
 	if (joan_dec_transparent_reconfig) {
 		/*
 		 * 候选 81：不能在这个上下文里同步重配 —— 事件处理跑在 HFI 消息线程上，
@@ -2185,6 +2201,8 @@ static void vdec_event_change_locked(struct venus_inst *inst,
 		wake_up(&inst->reconf_wait);
 		return;
 	}
+
+queue_event:
 
 	JOAN_VTRACE("event_change: 队列前 pending=%d subscribed=%#x",
 		    v4l2_event_pending(&inst->fh), inst->subscriptions);
