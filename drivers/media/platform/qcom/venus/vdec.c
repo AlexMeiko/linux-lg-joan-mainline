@@ -673,7 +673,15 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
 			 */
 			fdata.device_addr = inst->joan_last_in_addr;
 			fdata.alloc_len = inst->input_buf_size;
-			fdata.clnt_data = 0;
+			/*
+			 * EOS 不是真正的 vb2 缓冲，完成时不应该匹配到任何缓冲。
+			 * 原来用 clnt_data=0，而完成路径是按 index 匹配的 ——
+			 * 一旦此刻 index0 的缓冲正躺在 ready 队列里（用户态重新入队
+			 * 之后），EOS 的完成就会把它提前归还，固件还在读这块内存，
+			 * 而它真正的完成则再也匹配不到、被静默丢弃。
+			 * 用不可能等于 index 的哨兵值，完成时自然匹配失败、被忽略。
+			 */
+			fdata.clnt_data = VENUS_EOS_TAG;
 			JOAN_VTRACE("vdec_dec_cmd: EOS addr=%#x alloc=%u",
 				    (u32)fdata.device_addr, fdata.alloc_len);
 		}
@@ -1884,6 +1892,7 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		venus_helper_change_dpb_owner(inst, vbuf, type, buf_type, tag);
 		return;
 	}
+
 	if (joan_dec_clean_stream)
 		to_venus_buffer(vbuf)->joan_submitted = false;
 

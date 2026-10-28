@@ -460,6 +460,9 @@ enum venus_inst_modes {
  * @flags:	bitmask flags describing current instance mode
  * @dpb_ids:	DPB buffer ID's
  */
+/* EOS 伪缓冲的 clnt_data，取值不会与任何 vb2 缓冲 index 冲突 */
+#define VENUS_EOS_TAG		0xffffffffu
+
 #define VENUS_SEQ_DEPTH 16
 
 /*
