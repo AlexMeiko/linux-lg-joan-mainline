@@ -1874,6 +1874,19 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	struct vb2_buffer *vb;
 	unsigned int type;
 
+	/*
+	 * 安全网：close 开始之后不应该再有完成回调。
+	 * vdec_buf_done 跑在 HFI 消息线程上、不持 inst->lock，而 close 会
+	 * 释放队列和实例。close 里已经用两次 synchronize_irq() 把窗口关掉，
+	 * 这条 WARN 就是那层保证的运行时哨兵 —— 一旦触发说明窗口又开了。
+	 *
+	 * 注：不要在这里检查 codec_state == DEINIT。stop_streaming 是先置
+	 * DEINIT 再调 hfi_session_stop()，teardown 期间收到在途完成是正常的，
+	 * 那样写会误报（实测踩过）。
+	 */
+	if (WARN_ON_ONCE(inst->seq_closing))
+		return;
+
 	vdec_pm_touch(inst);
 
 	if (buf_type == HFI_BUFFER_INPUT)
