@@ -246,6 +246,16 @@ struct dpu_encoder_phys_cmd {
 	int pp_timeout_report_cnt;
 	atomic_t pending_vblank_cnt;
 	wait_queue_head_t pending_vblank_wq;
+
+	/**
+	 * @ctl_started: the CTL_START handshake for the current enable cycle
+	 * has already been attempted. The interrupt is only raised on the
+	 * 0->1 transition of the CTL, so waiting for it on every commit makes
+	 * each frame stall for KICKOFF_TIMEOUT_MS on hardware where the
+	 * transition is not observable (msm8998 / DPU 3.0: the CTL_START
+	 * readback used by dpu_hw_ctl_is_started() reads back 0).
+	 */
+	bool ctl_started;
 };
 
 /**

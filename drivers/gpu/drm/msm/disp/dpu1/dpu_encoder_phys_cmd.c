@@ -478,6 +478,9 @@ static void dpu_encoder_phys_cmd_enable(struct dpu_encoder_phys *phys_enc)
 		return;
 	}
 
+	/* a new enable cycle needs a fresh CTL_START handshake */
+	cmd_enc->ctl_started = false;
+
 	dpu_encoder_phys_cmd_enable_helper(phys_enc);
 	phys_enc->enable_state = DPU_ENC_ENABLED;
 }
@@ -677,13 +680,35 @@ static int dpu_encoder_phys_cmd_wait_for_tx_complete(
 static int dpu_encoder_phys_cmd_wait_for_commit_done(
 		struct dpu_encoder_phys *phys_enc)
 {
+	struct dpu_encoder_phys_cmd *cmd_enc =
+			to_dpu_encoder_phys_cmd(phys_enc);
+	int ret;
+
 	/* only required for master controller */
 	if (!dpu_encoder_phys_cmd_is_master(phys_enc))
 		return 0;
 
-	if (phys_enc->irq[INTR_IDX_CTL_START] &&
-	    !phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl))
-		return _dpu_encoder_phys_cmd_wait_for_ctl_start(phys_enc);
+	/*
+	 * The CTL_START interrupt is only raised on the 0->1 transition of the
+	 * CTL, so it can be waited for at most once per enable cycle. On
+	 * msm8998 (DPU 3.0) the CTL_START readback used by is_started() stays 0
+	 * even while the CTL is running, which defeats the upstream check and
+	 * makes every single commit wait KICKOFF_TIMEOUT_MS for an interrupt
+	 * that will never come again. Track the handshake locally instead, and
+	 * fall back to the pingpong done (tx complete) completion afterwards.
+	 */
+	if (phys_enc->irq[INTR_IDX_CTL_START] && !cmd_enc->ctl_started &&
+	    !phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl)) {
+		ret = _dpu_encoder_phys_cmd_wait_for_ctl_start(phys_enc);
+		/*
+		 * Mark as attempted even on timeout: the frame was flushed and
+		 * is being scanned out (the panel keeps updating), the
+		 * handshake is simply not observable here. Leaving the flag
+		 * clear would make every following commit wait again.
+		 */
+		cmd_enc->ctl_started = true;
+		return ret;
+	}
 
 	return dpu_encoder_phys_cmd_wait_for_tx_complete(phys_enc);
 }
