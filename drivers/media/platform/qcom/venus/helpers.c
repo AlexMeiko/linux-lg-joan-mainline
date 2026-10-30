@@ -5,6 +5,16 @@
  */
 #include <linux/idr.h>
 #include <linux/list.h>
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
@@ -17,6 +27,59 @@
 #include "hfi_helper.h"
 #include "pm_helpers.h"
 #include "hfi_platform.h"
+#include <linux/module.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+
+/* 候选 27：解码输入 flags 开关（bit0=CODECCONFIG, bit1=ENDOFFRAME），默认 0 */
+unsigned int joan_enc_prewarm;
+EXPORT_SYMBOL_GPL(joan_enc_prewarm);
+
+bool joan_dec_clean_stream = 1;
+EXPORT_SYMBOL_GPL(joan_dec_clean_stream);
+
+unsigned int joan_enc_recover;
+EXPORT_SYMBOL_GPL(joan_enc_recover);
+
+unsigned int joan_enc_cap_before_input;
+EXPORT_SYMBOL_GPL(joan_enc_cap_before_input);
+
+unsigned int joan_enc_clamp_fill = 1;
+
+/* 候选 136：驱动侧 trace 环，避免被 dmesg 环形缓冲冲掉 */
+char joan_trace_ring[32768];
+static DEFINE_SPINLOCK(joan_trace_lock);
+unsigned int joan_trace_ring_pos;
+module_param_string(joan_trace_ring, joan_trace_ring, sizeof(joan_trace_ring), 0444);
+
+void joan_tlog(const char *fmt, ...)
+{
+	char tmp[192];
+	va_list args;
+	unsigned long flags;
+	int n;
+
+	va_start(args, fmt);
+	n = vsnprintf(tmp, sizeof(tmp), fmt, args);
+	va_end(args);
+	if (n <= 0)
+		return;
+	if (n >= (int)sizeof(tmp))
+		n = sizeof(tmp) - 1;
+
+	spin_lock_irqsave(&joan_trace_lock, flags);
+	if (joan_trace_ring_pos + n + 1 >= sizeof(joan_trace_ring))
+		joan_trace_ring_pos = 0;
+	memcpy(joan_trace_ring + joan_trace_ring_pos, tmp, n);
+	joan_trace_ring_pos += n;
+	joan_trace_ring[joan_trace_ring_pos] = '\0';
+	spin_unlock_irqrestore(&joan_trace_lock, flags);
+}
+EXPORT_SYMBOL_GPL(joan_tlog);
+
+unsigned int joan_trace_quiet = 1;
+EXPORT_SYMBOL_GPL(joan_trace_quiet);
+
 #include "hfi_parser.h"
 
 #define NUM_MBS_720P	(((ALIGN(1280, 16)) >> 4) * ((ALIGN(736, 16)) >> 4))
@@ -244,6 +307,9 @@ static int intbufs_set_buffer(struct venus_inst *inst, u32 type)
 	if (ret)
 		return 0;
 
+	JOAN_VTRACE("intbuf: type=%#x size=%u count_actual=%u count_min=%u",
+		    type, bufreq.size, bufreq.count_actual, bufreq.count_min);
+
 	if (!bufreq.size)
 		return 0;
 
@@ -278,6 +344,8 @@ static int intbufs_set_buffer(struct venus_inst *inst, u32 type)
 		}
 
 		list_add_tail(&buf->list, &inst->internalbufs);
+		JOAN_VTRACE("intbuf: type=%#x size=%u da=%pad (共 %u 个)",
+			    buf->type, buf->size, &buf->da, i + 1);
 	}
 
 	return 0;
@@ -303,6 +371,17 @@ static int intbufs_unset_buffers(struct venus_inst *inst)
 		bd.response_required = true;
 
 		ret = hfi_session_unset_buffers(inst, &bd);
+		if (ret) {
+			/*
+			 * unset 失败/超时不等于固件已经停止访问这块内存。
+			 * 此时释放就是硬件层面的 use-after-free（固件仍可能写），
+			 * 宁可泄漏也不要冒这个险；保留在链表里，下次还能重试。
+			 */
+			dev_err(inst->core->dev,
+				"joan: unset buffer type=%#x 失败 %d，保留内存不释放\n",
+				buf->type, ret);
+			continue;
+		}
 
 		list_del_init(&buf->list);
 		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
@@ -394,6 +473,13 @@ int venus_helper_intbufs_realloc(struct venus_inst *inst)
 		bd.response_required = true;
 
 		ret = hfi_session_unset_buffers(inst, &bd);
+		if (ret) {
+			/* 同上：unset 失败时固件可能还在写，不能释放 */
+			dev_err(inst->core->dev,
+				"joan: unset buffer type=%#x 失败 %d，保留内存不释放\n",
+				buf->type, ret);
+			continue;
+		}
 
 		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
 			       buf->attrs);
@@ -502,6 +588,17 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 	struct vb2_buffer *vb = &vbuf->vb2_buf;
 	unsigned int type = vb->type;
 	struct hfi_frame_data fdata;
+	int ret;
+
+	/*
+	 * Ready queue 里可能还留着固件正在处理的缓冲（mem2mem 的 ready 队列
+	 * 与"固件所有权"不是一回事）。原来这个去重只对解码方向生效，
+	 * 编码的 CAPTURE 缓冲虽然也置了 joan_submitted，却没有检查，
+	 * 于是 device_run 可能把固件正在用的缓冲再提交一次。
+	 * 现在两个方向统一按标志去重；标志在完成路径与 stop 路径清除。
+	 */
+	if (buf->joan_submitted)
+		return 0;
 
 	memset(&fdata, 0, sizeof(fdata));
 	fdata.alloc_len = buf->size;
@@ -510,6 +607,19 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 	do_div(fdata.timestamp, NSEC_PER_USEC);
 	fdata.flags = 0;
 	fdata.clnt_data = vbuf->vb2_buf.index;
+	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC)
+		to_venus_buffer(vbuf)->joan_submitted = true;
+	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && fdata.device_addr)
+		inst->joan_last_in_addr = fdata.device_addr;
+	if (!joan_trace_quiet && inst->session_type == VIDC_SESSION_TYPE_DEC)
+		joan_tlog("[dec] t=%u i=%u iova=%pad al=%u\n", type, vb->index,
+			  &fdata.device_addr, fdata.alloc_len);
+
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC)
+		JOAN_VTRACE("session_process_buf: st=%u type=%u index=%u alloc=%u filled=%u iova=%pad",
+			    inst->session_type, type, vb->index, fdata.alloc_len,
+			    vb2_get_plane_payload(vb, 0), &fdata.device_addr);
 
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		fdata.buffer_type = HFI_BUFFER_INPUT;
@@ -518,6 +628,34 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 
 		if (vbuf->flags & V4L2_BUF_FLAG_LAST || !fdata.filled_len)
 			fdata.flags |= HFI_BUFFERFLAG_EOS;
+
+		/*
+		 * 候选 52：H.264/H.265 的每个 packet 就是一个访问单元，固件需要
+		 * HFI_BUFFERFLAG_ENDOFFRAME 才知道一帧收完；否则它会一直缓冲，
+		 * 直到 STOP 才吐出空缓冲（实测压了 248 秒）。
+		 */
+		/*
+		 * 候选 91：msm8998 编码固件只接受「可见尺寸」的填入长度
+		 * （320x240 NV12 = 115200），对齐后的 138240 会返回 0x1002。
+		 */
+		if (inst->session_type == VIDC_SESSION_TYPE_ENC)
+			JOAN_VTRACE("ENC 输入: alloc=%u filled=%u vis=%ux%u hfi_flags=%#x v4l2_flags=%#x",
+				    fdata.alloc_len, fdata.filled_len,
+				    inst->joan_vis_w, inst->joan_vis_h,
+				    fdata.flags, vbuf->flags);
+
+		if (joan_enc_clamp_fill &&
+		    inst->session_type == VIDC_SESSION_TYPE_ENC &&
+		    inst->joan_vis_w && inst->joan_vis_h) {
+			u32 vis = inst->joan_vis_w * inst->joan_vis_h * 3 / 2;
+
+			if (fdata.filled_len > vis)
+				fdata.filled_len = vis;
+		}
+
+		if (inst->session_type == VIDC_SESSION_TYPE_DEC)
+			fdata.flags |= HFI_BUFFERFLAG_ENDOFFRAME;
+
 
 		if (inst->session_type == VIDC_SESSION_TYPE_DEC)
 			put_ts_metadata(inst, vbuf);
@@ -532,7 +670,13 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 		fdata.offset = 0;
 	}
 
-	return hfi_session_process_buf(inst, &fdata);
+
+	if (joan_dec_clean_stream && inst->session_type == VIDC_SESSION_TYPE_DEC)
+		buf->joan_submitted = true;
+	ret = hfi_session_process_buf(inst, &fdata);
+	if (ret && inst->session_type == VIDC_SESSION_TYPE_DEC)
+		buf->joan_submitted = false;
+	return ret;
 }
 
 static bool is_dynamic_bufmode(struct venus_inst *inst)
@@ -1500,6 +1644,10 @@ void venus_helper_vb2_buf_queue(struct vb2_buffer *vb)
 	struct v4l2_m2m_ctx *m2m_ctx = inst->m2m_ctx;
 	int ret;
 
+	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
+		JOAN_VTRACE("vb2_buf_queue: cap idx=%u started=%d state=%d",
+			    vb->index, vb2_start_streaming_called(vb->vb2_queue),
+			    inst->codec_state);
 	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
 
 	/* Skip processing queued capture buffers after LAST flag */
@@ -1513,6 +1661,31 @@ void venus_helper_vb2_buf_queue(struct vb2_buffer *vb)
 	if (inst->session_type == VIDC_SESSION_TYPE_ENC &&
 	    !(inst->streamon_out && inst->streamon_cap))
 		return;
+
+	/*
+	 * 候选 139：编码器必须先把捕获（输出）缓冲交给固件，才能提交输入帧。
+	 * 否则固件在"没有输出缓冲"的状态下收到输入，会把该帧判 0x1002 并把
+	 * 会话带进错误状态（转码时表现为之后每一帧都被拒、最后 System error）。
+	 */
+	if (joan_enc_cap_before_input &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) && !inst->joan_cap_ready) {
+		joan_tlog("[hold-in] idx=%u\n", vb->index);
+		return;
+	}
+
+	/*
+	 * 候选 67：解码器在 SOURCE_CHANGE 之后、用户态重配完成之前，
+	 * 不要再把新的输入缓冲灌给固件 —— 实测固件此时收到新数据会先报
+	 * "缓冲不足"(0x1000002)，随后直接 SYS_ERROR。
+	 * 先攒在 m2m 队列里，等 reconfigure 完成（vdec_start_capture）再提交。
+	 */
+	if (inst->session_type == VIDC_SESSION_TYPE_DEC && inst->reconfig &&
+	    V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) &&
+	    inst->codec_state == VENUS_DEC_STATE_CAPTURE_SETUP) {
+		JOAN_VTRACE("buf_queue: reconfig 中，暂缓提交输入 idx=%u", vb->index);
+		return;
+	}
 
 	if (vb2_start_streaming_called(vb->vb2_queue)) {
 		ret = is_buf_refed(inst, vbuf);
@@ -1532,11 +1705,29 @@ void venus_helper_buffers_done(struct venus_inst *inst, unsigned int type,
 	struct vb2_v4l2_buffer *buf;
 
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-		while ((buf = v4l2_m2m_src_buf_remove(inst->m2m_ctx)))
+		while ((buf = v4l2_m2m_src_buf_remove(inst->m2m_ctx))) {
+			to_venus_buffer(buf)->joan_submitted = false;
 			v4l2_m2m_buf_done(buf, state);
+		}
 	} else if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-		while ((buf = v4l2_m2m_dst_buf_remove(inst->m2m_ctx)))
+		/*
+		 * 停止时把"持有"链表整个清空。启动失败会把捕获缓冲归还给
+		 * 用户态，但它们若还挂在 joan_held_caps 里，joan_held 仍为 true，
+		 * 重新入队时会被跳过 —— 编码器就再也跑不起来。
+		 */
+		if (inst->session_type == VIDC_SESSION_TYPE_ENC) {
+			struct venus_buffer *h, *tmp;
+
+			list_for_each_entry_safe(h, tmp, &inst->joan_held_caps,
+						 joan_list) {
+				list_del_init(&h->joan_list);
+				h->joan_held = false;
+			}
+		}
+		while ((buf = v4l2_m2m_dst_buf_remove(inst->m2m_ctx))) {
+			to_venus_buffer(buf)->joan_submitted = false;
 			v4l2_m2m_buf_done(buf, state);
+		}
 	}
 }
 EXPORT_SYMBOL_GPL(venus_helper_buffers_done);
@@ -1550,11 +1741,16 @@ void venus_helper_vb2_stop_streaming(struct vb2_queue *q)
 	mutex_lock(&inst->lock);
 
 	if (inst->streamon_out & inst->streamon_cap) {
-		ret = hfi_session_stop(inst);
-		ret |= hfi_session_unload_res(inst);
-		ret |= venus_helper_unregister_bufs(inst);
-		ret |= venus_helper_intbufs_free(inst);
-		ret |= hfi_session_deinit(inst);
+		int r1, r2, r3, r4, r5;
+
+		r1 = hfi_session_stop(inst);
+		r2 = hfi_session_unload_res(inst);
+		r3 = venus_helper_unregister_bufs(inst);
+		r4 = venus_helper_intbufs_free(inst);
+		r5 = hfi_session_deinit(inst);
+		JOAN_VTRACE("stop_streaming: stop=%d unload=%d unreg=%d free=%d deinit=%d",
+			    r1, r2, r3, r4, r5);
+		ret = r1 | r2 | r3 | r4 | r5;
 
 		if (inst->session_error || test_bit(0, &core->sys_error))
 			ret = -EIO;
@@ -1567,6 +1763,9 @@ void venus_helper_vb2_stop_streaming(struct vb2_queue *q)
 		venus_pm_load_scale(inst);
 		INIT_LIST_HEAD(&inst->registeredbufs);
 	}
+
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC)
+		inst->joan_enc_running = false;
 
 	venus_helper_buffers_done(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 				  VB2_BUF_STATE_ERROR);
@@ -1597,6 +1796,12 @@ void venus_helper_vb2_queue_error(struct venus_inst *inst)
 	vb2_queue_error(q);
 }
 EXPORT_SYMBOL_GPL(venus_helper_vb2_queue_error);
+
+int venus_helper_process_one_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
+{
+	return session_process_buf(inst, vbuf);
+}
+EXPORT_SYMBOL_GPL(venus_helper_process_one_buf);
 
 int venus_helper_process_initial_cap_bufs(struct venus_inst *inst)
 {
@@ -1711,7 +1916,9 @@ int venus_helper_session_init(struct venus_inst *inst)
 	codec = inst->session_type == VIDC_SESSION_TYPE_DEC ?
 			inst->fmt_out->pixfmt : inst->fmt_cap->pixfmt;
 
+	JOAN_VTRACE("helper_session_init: session_type=%u codec=%#x", session_type, codec);
 	ret = hfi_session_init(inst, codec);
+	JOAN_VTRACE("helper_session_init: hfi_session_init ret=%d", ret);
 	if (ret)
 		return ret;
 

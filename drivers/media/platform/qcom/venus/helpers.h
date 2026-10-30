@@ -8,6 +8,8 @@
 
 #include <media/videobuf2-v4l2.h>
 
+extern bool joan_dec_clean_stream;
+
 struct venus_inst;
 struct venus_core;
 
@@ -63,6 +65,9 @@ int venus_helper_intbufs_free(struct venus_inst *inst);
 int venus_helper_intbufs_realloc(struct venus_inst *inst);
 int venus_helper_queue_dpb_bufs(struct venus_inst *inst);
 int venus_helper_unregister_bufs(struct venus_inst *inst);
+void joan_tlog(const char *fmt, ...);
+extern unsigned int joan_enc_recover;
+int venus_helper_process_one_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf);
 int venus_helper_process_initial_cap_bufs(struct venus_inst *inst);
 int venus_helper_process_initial_out_bufs(struct venus_inst *inst);
 void venus_helper_get_ts_metadata(struct venus_inst *inst, u64 timestamp_us,

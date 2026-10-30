@@ -10,14 +10,29 @@
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 
 #include "core.h"
 #include "hfi_cmds.h"
 #include "hfi_msgs.h"
 #include "hfi_venus.h"
+#include "helpers.h"
 #include "hfi_venus_io.h"
 #include "firmware.h"
+
+extern unsigned int joan_trace_quiet;
+
+#ifndef JOAN_VTRACE
+#define JOAN_VTRACE(fmt, ...) do { \
+	pr_info("joan-venus-trace: " fmt "\n", ##__VA_ARGS__); \
+} while (0)
+#endif
+
+/* 取证辅助（定义在 core.c）：MMCC 状态与独立 HW_VERSION 检查。 */
+void joan_venus_mmcc_probe(const char *tag);
+int joan_venus_hwversion_probe(struct venus_core *core, const char *tag);
+
 
 #define HFI_MASK_QHDR_TX_TYPE		0xff000000
 #define HFI_MASK_QHDR_RX_TYPE		0x00ff0000
@@ -364,6 +379,66 @@ static void venus_free(struct venus_hfi_device *hdev, struct mem_desc *mem)
 	dma_free_attrs(dev, mem->size, mem->kva, mem->da, mem->attrs);
 }
 
+/*
+ * joan_skip_presets=1 —— MSM8998 仅保留 CPU_CGC_DIS=0，其余 preset 全跳过。
+ *
+ * 背景：msm8998 的 `msm8998_reg_preset` 8 条全部写在 `0x80124/0x80550/0x80560/
+ * 0x80568/0x80570/0x80580/0x80588/0xe2010`，前 7 条都在 **VBIF 窗（+0x80000）**内；
+ * 既有实验中 VBIF 访问曾触发复位，亦曾全零返回；可访问性随阶段变化。
+ * 精确放行已有 0xe2010=0 初始化，不据单点读数外推整个窗口。
+ */
+static bool joan_skip_presets = 1;
+
+/*
+ * joan_vbif_write=1 —— 是否真的去碰 VBIF 寄存器窗（base+0x80000 起）。
+ *
+ * 默认 0，关闭此开关控制的 FORCE_ON/AXI halt 访问；preset 另用
+ * joan_skip_presets=1，显式扫描/poke 参数仍不得使用。既有证据：
+ *   - 单变量只读扫描：读 base+0x80000 **立即硬复位**（bootreasoncode=0x20），
+ *     而 base+0xe0000/0xc0000/0xd2000/0xd204c 全部可读；
+ *   - 同一行 VBIF 访问**一次成功一次挂**（状态相关，不可靠）；
+ *   - 下游 msm8998 `venus_boot.c` 里 `VBIF_CLK_ON` FORCE_ON 有前置条件
+ *     `hw_ver_major==1 && minor∈{2,3}`（Venus 1.2/1.3），msm8998（3.0.43）**从来不走**。
+ * 本候选同时移除隐式 post-run VBIF 诊断，仍须真机验证是否稳定。
+ */
+static bool joan_vbif_write;
+
+/*
+ * joan_boot_state —— 只读采样「ARM9 到底有没有被放出来 / 有没有在跑」。
+ *
+ * 背景：use_tz=1 时 host 只发 PAS（peripheral id 9），固件搬运与放核全在 TZ 内部，
+ * host 无任何回读；每轮 HFI 握手恒定 status=0/-110。仅凭 INIT 0→1、ARG3=0 无法
+ * 区分「固件根本没跑」与「固件跑了但队列/HFI 不对」。
+ *
+ * 取值：0=关闭（默认）；1=A 阶段（只读，全部落在本机已实读通过的寄存器页：
+ * 0xe0000 / 0xe000c / 0xe2014 / 0xd2048-0xd2068 + 主机 DMA 队列 RAM）；
+ * 2=A 阶段 + B 阶段（追加 0xe3000 / 0xe2000 / 0xe1020-0xe1034 只读，逐条 before 标记；
+ * 一旦挂死即「形态 B 纯总线停滞」，需人工断电且拿不到 journalctl -b -1）。
+ *
+ * 禁区不变：0x80000-0xbffff（VBIF 窗，读即硬复位）与 0x80124/0x80550-0x80588 preset
+ * 一律不碰。本函数只有 readl，没有 writel。
+ */
+static unsigned int joan_boot_state;
+
+/*
+ * joan_sfr_clear —— 第十八候选取证开关（默认 1）。
+ *
+ * SFR 是固件崩溃时写诊断文本的 4 KiB 共享 RAM，位于 venus_mem（0x94900000）里，
+ * **重启后不清零**：第十七候选第二次上电读到的 "CPUSS WD Timeout or Unknown Exception"
+ * 可能是上一轮遗留的旧文本。清空后再看是否重新出现，才能判断固件是不是"本次"崩的。
+ * 纯主机内存写，不触碰任何 MMIO 寄存器。
+ */
+static unsigned int joan_sfr_clear = 1;
+
+/*
+ * joan_clock_config —— 每次上电都写 WRAPPER_CLOCK_CONFIG(0xe0004)=0。
+ *
+ * 下游 vidc 在 __prepare_enable_clks() 末尾按 1 次/每次上电 写它；主线此前从未写过。
+ * 第十七候选只在 venus_boot()（probe 一次）里写，导致第二次/第三次 runtime resume
+ * 后门控重新生效、ARM9 不再响应握手（实测 count=100 / -110）。
+ */
+unsigned int joan_clock_config = 1;
+
 static void venus_set_registers(struct venus_hfi_device *hdev)
 {
 	const struct venus_resources *res = hdev->core->res;
@@ -371,8 +446,27 @@ static void venus_set_registers(struct venus_hfi_device *hdev)
 	unsigned int count = res->reg_tbl_size;
 	unsigned int i;
 
-	for (i = 0; i < count; i++)
+	if (joan_skip_presets &&
+	    !of_device_is_compatible(hdev->core->dev->of_node, "qcom,msm8998-venus")) {
+		JOAN_VTRACE("setreg: SKIPPED (joan_skip_presets=1, would be count=%u)",
+			    count);
+		return;
+	}
+
+	JOAN_VTRACE("setreg: enter base=%px count=%u", hdev->core->base, count);
+	for (i = 0; i < count; i++) {
+		if (joan_skip_presets &&
+		    (tbl[i].reg != WRAPPER_BASE + WRAPPER_CPU_CGC_DIS ||
+		     tbl[i].value != 0))
+			continue;
+
+		JOAN_VTRACE("setreg[%u/%u]: before writel reg=%#x val=%#x",
+			    i, count, tbl[i].reg, tbl[i].value);
 		writel(tbl[i].value, hdev->core->base + tbl[i].reg);
+		JOAN_VTRACE("setreg[%u/%u]: posted write returned reg=%#x (no readback)",
+			    i, count, tbl[i].reg);
+	}
+	JOAN_VTRACE("setreg: done");
 }
 
 static void venus_soft_int(struct venus_hfi_device *hdev)
@@ -401,6 +495,32 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
 		return -EINVAL;
 
 	cmd_packet = (struct hfi_pkt_hdr *)pkt;
+	{
+		static unsigned int joan_cmd_dump;
+
+		if (!joan_trace_quiet && joan_cmd_dump < 150) {
+			const u32 *w = pkt;
+
+			joan_cmd_dump++;
+			joan_tlog("[cmd] t=%#x sess=%u w4=%08x w5=%08x\n",
+				  cmd_packet->pkt_type, w[2], w[4], w[5]);
+		}
+	}
+	if (cmd_packet->pkt_type == 0x211004) {
+		const u32 *w = pkt;
+
+		static unsigned int joan_etb_dump;
+		if (joan_etb_dump < 8) {
+			joan_etb_dump++;
+			joan_tlog("[etb%u] %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+				  w[2], w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+				  w[7], w[8], w[9], w[10], w[11], w[12], w[13],
+				  w[14], w[15]);
+		}
+		JOAN_VTRACE("etb_tx: sess=%u w=%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+			    w[2], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+			    w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+	}
 	hdev->last_packet_type = cmd_packet->pkt_type;
 
 	queue = &hdev->queues[IFACEQ_CMD_IDX];
@@ -463,6 +583,137 @@ static int venus_hfi_core_set_resource(struct venus_core *core, u32 id,
 	return 0;
 }
 
+static void joan_venus_boot_sample(struct venus_hfi_device *hdev, u32 reg,
+				   const char *phase, const char *name)
+{
+	u32 value;
+
+	JOAN_VTRACE("boot_sample[%s/%s]: before readl reg=%#x",
+		    phase, name, CPU_CS_BASE + reg);
+	value = readl(hdev->core->cpu_cs_base + reg);
+	JOAN_VTRACE("boot_sample[%s/%s]: value=%#x", phase, name, value);
+}
+
+/*
+ * 只读快照：wrapper（core 状态/中断/时钟门控）+ CPU_CS（ARG0-3/INIT/UC_REGION）
+ * + 主机 DMA 里的队列表与三个队列头。无写、无 PM/clk/SCM/DMA 调用。
+ * joan_boot_state>=2 时再读 B 阶段寄存器，最后一条（A9SS_SW_RESET）最危险。
+ */
+static void joan_venus_boot_state_sample(struct venus_hfi_device *hdev,
+					 const char *tag)
+{
+	void __iomem *w = hdev->core->wrapper_base;
+	void __iomem *cs = hdev->core->cpu_cs_base;
+	struct hfi_queue_table_header *tbl = hdev->ifaceq_table.kva;
+	u32 hwver, cpu_st, intr_st, arg0, arg1, arg2, arg3, init, uc_a, uc_s;
+	unsigned int i;
+
+	/* A 阶段：全部为已实读通过的寄存器页 */
+	hwver = readl(w + WRAPPER_HW_VERSION);
+	cpu_st = readl(w + WRAPPER_CPU_STATUS);
+	intr_st = readl(w + WRAPPER_INTR_STATUS);
+	arg0 = readl(cs + CPU_CS_SCIACMDARG0);
+	arg1 = readl(cs + CPU_CS_SCIACMDARG1);
+	arg2 = readl(cs + CPU_CS_SCIACMDARG2);
+	arg3 = readl(cs + CPU_CS_SCIACMDARG3);
+	init = readl(cs + VIDC_CTRL_INIT);
+	uc_a = readl(cs + UC_REGION_ADDR);
+	uc_s = readl(cs + UC_REGION_SIZE);
+
+	JOAN_VTRACE("boot_state[%s]: hwver=%#x cpu_status=%#x(wfi=%u) intr=%#x",
+		    tag, hwver, cpu_st, cpu_st & WRAPPER_CPU_STATUS_WFI, intr_st);
+	JOAN_VTRACE("boot_state[%s]: arg0=%#x(inits=%u err=%#x pcrdy=%u idle=%u) arg1=%#x arg2=%#x arg3=%#x",
+		    tag, arg0, arg0 & CPU_CS_SCIACMDARG0_INIT_STATUS_MASK,
+		    (arg0 & CPU_CS_SCIACMDARG0_ERROR_STATUS_MASK) >>
+			    CPU_CS_SCIACMDARG0_ERROR_STATUS_SHIFT,
+		    !!(arg0 & CPU_CS_SCIACMDARG0_PC_READY),
+		    !!(arg0 & CPU_CS_SCIACMDARG0_INIT_IDLE_MSG_MASK),
+		    arg1, arg2, arg3);
+	JOAN_VTRACE("boot_state[%s]: init=%#x uc_region=%#x/%#x",
+		    tag, init, uc_a, uc_s);
+
+	/* 纯 RAM，零风险；probe 早期可能尚未分配 */
+	if (!tbl) {
+		JOAN_VTRACE("boot_state[%s]: queue table not allocated", tag);
+	} else {
+		JOAN_VTRACE("boot_state[%s]: tbl ver=%u size=%u qhdr0=%u qhdr_sz=%u num_q=%u act=%u",
+			    tag, tbl->version, tbl->size, tbl->qhdr0_offset,
+			    tbl->qhdr_size, tbl->num_q, tbl->num_active_q);
+		for (i = 0; i < IFACEQ_NUM; i++) {
+			struct hfi_queue_header *q = hdev->queues[i].qhdr;
+
+			if (!q)
+				continue;
+			JOAN_VTRACE("boot_state[%s]: q%u type=%#x status=%u rd=%u wr=%u size=%u",
+				    tag, i, q->type, q->status, q->read_idx,
+				    q->write_idx, q->q_size);
+		}
+	}
+
+	if (joan_boot_state < 2)
+		return;
+
+	/*
+	 * B 阶段：wrapper 上从未实读验证过的页。逐条 before 标记，挂死时
+	 * journalctl -b -1 里最后一条 before 就是触发点；最后一条最危险。
+	 */
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_CPU_CLOCK_CONFIG);
+	arg0 = readl(w + WRAPPER_CPU_CLOCK_CONFIG);
+	JOAN_VTRACE("boot_state[%s]: cpu_clock_config=%#x", tag, arg0);
+
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_CPA_START_ADDR);
+	arg0 = readl(w + WRAPPER_CPA_START_ADDR);
+	JOAN_VTRACE("boot_state[%s]: cpa_start=%#x", tag, arg0);
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_CPA_END_ADDR);
+	arg0 = readl(w + WRAPPER_CPA_END_ADDR);
+	JOAN_VTRACE("boot_state[%s]: cpa_end=%#x", tag, arg0);
+
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_FW_START_ADDR);
+	arg0 = readl(w + WRAPPER_FW_START_ADDR);
+	JOAN_VTRACE("boot_state[%s]: fw_start=%#x", tag, arg0);
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_FW_END_ADDR);
+	arg0 = readl(w + WRAPPER_FW_END_ADDR);
+	JOAN_VTRACE("boot_state[%s]: fw_end=%#x", tag, arg0);
+
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_NONPIX_START_ADDR);
+	arg0 = readl(w + WRAPPER_NONPIX_START_ADDR);
+	JOAN_VTRACE("boot_state[%s]: nonpix_start=%#x", tag, arg0);
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_NONPIX_END_ADDR);
+	arg0 = readl(w + WRAPPER_NONPIX_END_ADDR);
+	JOAN_VTRACE("boot_state[%s]: nonpix_end=%#x", tag, arg0);
+
+	JOAN_VTRACE("boot_state[%s]: before readl(wrapper+%#x)", tag, WRAPPER_A9SS_SW_RESET);
+	arg0 = readl(w + WRAPPER_A9SS_SW_RESET);
+	JOAN_VTRACE("boot_state[%s]: a9ss_sw_reset=%#x reset_bit=%u", tag, arg0,
+		    !!(arg0 & WRAPPER_A9SS_SW_RESET_BIT));
+}
+
+/* Only the live host DMA allocation is read, with a fixed payload bound. */
+static void joan_venus_sfr_ram_sample(struct venus_hfi_device *hdev,
+				      const char *phase)
+{
+	const u32 *sfr = hdev->sfr.kva;
+	u32 snapshot[1 + 128 / sizeof(u32)];
+	unsigned int i;
+
+	if (!sfr || hdev->sfr.size < sizeof(snapshot)) {
+		JOAN_VTRACE("sfr_ram[%s]: unavailable size=%u", phase, hdev->sfr.size);
+		return;
+	}
+
+	JOAN_VTRACE("sfr_ram[%s]: before snapshot da=%#llx bytes=%zu", phase,
+		    (unsigned long long)hdev->sfr.da, sizeof(snapshot));
+	for (i = 0; i < ARRAY_SIZE(snapshot); i++)
+		snapshot[i] = READ_ONCE(sfr[i]);
+
+	JOAN_VTRACE("sfr_ram[%s]: buf_size=%#x payload_bytes=%zu", phase,
+		    snapshot[0], sizeof(snapshot) - sizeof(snapshot[0]));
+	print_hex_dump(KERN_INFO, "joan-venus-sfr-ram: ", DUMP_PREFIX_OFFSET,
+		       16, 1, snapshot + 1,
+		       sizeof(snapshot) - sizeof(snapshot[0]), true);
+	JOAN_VTRACE("sfr_ram[%s]: snapshot done", phase);
+}
+
 static int venus_boot_core(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
@@ -471,7 +722,11 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	unsigned int count = 0;
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
 	void __iomem *wrapper_base = hdev->core->wrapper_base;
+	bool joan_boot_observe = hdev->core->use_tz &&
+		of_device_is_compatible(dev->of_node, "qcom,msm8998-venus");
 	int ret = 0;
+
+	JOAN_VTRACE("boot_core: enter wrapper=%px", wrapper_base);
 
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core)) {
 		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
@@ -481,11 +736,23 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 		mask_val = WRAPPER_INTR_MASK_A2HVCODEC_MASK;
 	}
 
+	JOAN_VTRACE("boot_core: before writel intr_mask=%#x", mask_val);
 	writel(mask_val, wrapper_base + WRAPPER_INTR_MASK);
+	JOAN_VTRACE("boot_core: intr_mask written");
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
 
+	if (joan_boot_observe) {
+		joan_venus_boot_sample(hdev, VIDC_CTRL_INIT, "before-INIT", "INIT");
+		joan_venus_boot_sample(hdev, CPU_CS_SCIACMDARG3, "before-INIT", "ARG3");
+		joan_venus_sfr_ram_sample(hdev, "before-INIT");
+		if (joan_boot_state)
+			joan_venus_boot_state_sample(hdev, "pre-INIT");
+	}
+	JOAN_VTRACE("boot_core: before poll mask=%#x", mask_val);
 	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT), cpu_cs_base + VIDC_CTRL_INIT);
+	if (joan_boot_observe)
+		joan_venus_boot_sample(hdev, VIDC_CTRL_INIT, "after-INIT-write", "INIT");
 	while (!ctrl_status && count < max_tries) {
 		ctrl_status = readl(cpu_cs_base + CPU_CS_SCIACMDARG0);
 		if ((ctrl_status & CPU_CS_SCIACMDARG0_ERROR_STATUS_MASK) == 4) {
@@ -494,12 +761,26 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 			break;
 		}
 
+		if (joan_boot_observe && joan_boot_state && count == 40)
+			joan_venus_boot_state_sample(hdev, "mid-poll");
+
 		usleep_range(500, 1000);
 		count++;
 	}
 
 	if (count >= max_tries)
 		ret = -ETIMEDOUT;
+
+	JOAN_VTRACE("boot_core: poll done count=%u status=%#x ret=%d", count, ctrl_status, ret);
+
+	if (joan_boot_observe)
+		joan_venus_boot_sample(hdev, CPU_CS_SCIACMDARG3, "after-poll", "ARG3");
+	if (joan_boot_observe && joan_boot_state)
+		joan_venus_boot_state_sample(hdev, "post-poll");
+	if (joan_boot_observe && ret)
+		joan_venus_sfr_ram_sample(hdev, "after-failed-poll");
+	else if (joan_boot_observe && joan_boot_state)
+		joan_venus_sfr_ram_sample(hdev, "after-ok-poll");
 
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core) || IS_AR50_LITE(hdev->core)) {
 		writel(0x1, cpu_cs_base + CPU_CS_H2XSOFTINTEN_V6);
@@ -530,24 +811,142 @@ static u32 venus_hwversion(struct venus_hfi_device *hdev)
 	return major;
 }
 
+/*
+ * 历史诊断开关：默认关闭。FORCE_ON 仅有 Venus 1.2/1.3 下游依据，
+ * 不能视为 msm8998（Venus 3.x）的修复；本候选不新增此窗口访问。
+ */
+static void venus_vbif_clk_force_on(struct venus_core *core)
+{
+	/*
+	 * 注意：这里不能用 IS_V4()！mainline 的 IS_V4() 判的是
+	 * res->hfi_version == HFI_VERSION_4XX，而 msm8998_res 用的是
+	 * HFI_VERSION_3XX（HFI 协议版本），所以 msm8998 上 IS_V4() 是 false。
+	 * 但 msm8998 的 venus_halt_axi() 恰恰会走「通用 VBIF halt」分支
+	 * （读 VBIF_AXI_HALT_CTRL0），也就是说它必须访问 VBIF。
+	 *
+	 * 判据改成「有 VBIF 窗口且不是 V6 家族」：venus_assign_register_offsets()
+	 * 对非 V6 平台一律设置 vbif_base。
+	 */
+	if (IS_V6(core) || !core->vbif_base)
+		return;
+
+	if (!joan_vbif_write) {
+		JOAN_VTRACE("vbif_clk_on: SKIPPED (joan_vbif_write=0, 不碰 VBIF 窗)");
+		return;
+	}
+
+	JOAN_VTRACE("vbif_clk_on: force-on -> %px+%#x",
+		    core->vbif_base, VBIF_CLK_ON);
+	writel(VBIF_CLK_ON_FORCE_ON, core->vbif_base + VBIF_CLK_ON);
+	JOAN_VTRACE("vbif_clk_on: posted write returned");
+	/*
+	 * ★ 2026-10-11：**删除回读**。
+	 * 单变量实测（上电态只读扫描）：读 base+0x80000 立即硬复位，
+	 * 而 base+0xe0000 / 0xc0000 / 0xd2000 / 0xd204c 均可读。
+	 * 回读 VBIF 是纯诊断动作，却是随机硬复位源（同一行代码一次成功一次挂），
+	 * 故只保留 posted write，不再回读。
+	 */
+}
+
+static int joan_venus_reg_readback(struct venus_hfi_device *hdev, u32 reg,
+				   u32 expected, const char *name)
+{
+	u32 value;
+
+	JOAN_VTRACE("publish[%s]: before readl reg=%#x expected=%#x",
+		    name, CPU_CS_BASE + reg, expected);
+	value = readl(hdev->core->cpu_cs_base + reg);
+	JOAN_VTRACE("publish[%s]: value=%#x expected=%#x", name, value, expected);
+	if (value != expected) {
+		dev_err(hdev->core->dev, "%s readback mismatch (%#x != %#x)\n",
+			name, value, expected);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int joan_venus_publish_check(struct venus_hfi_device *hdev)
+{
+	struct venus_core *core = hdev->core;
+	int ret;
+
+	if (!core->use_tz ||
+	    !of_device_is_compatible(core->dev->of_node, "qcom,msm8998-venus"))
+		return 0;
+
+	/* Check only the registers just written, before publishing INIT. */
+	ret = joan_venus_reg_readback(hdev, UC_REGION_ADDR,
+				      (u32)hdev->ifaceq_table.da, "UC_REGION_ADDR");
+	if (ret)
+		return ret;
+	ret = joan_venus_reg_readback(hdev, UC_REGION_SIZE,
+				      SHARED_QSIZE, "UC_REGION_SIZE");
+	if (ret)
+		return ret;
+	ret = joan_venus_reg_readback(hdev, CPU_CS_SCIACMDARG2,
+				      (u32)hdev->ifaceq_table.da, "ARG2");
+	if (ret)
+		return ret;
+	ret = joan_venus_reg_readback(hdev, CPU_CS_SCIACMDARG1, 1, "ARG1");
+	if (ret)
+		return ret;
+	if (hdev->sfr.da)
+		return joan_venus_reg_readback(hdev, SFR_ADDR,
+					       (u32)hdev->sfr.da, "SFR_ADDR");
+
+	return 0;
+}
+
 static int venus_run(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
 	void __iomem *cpu_cs_base = hdev->core->cpu_cs_base;
 	int ret;
 
+	JOAN_VTRACE("run: enter");
+
+	if (joan_sfr_clear && hdev->sfr.kva && hdev->sfr.size) {
+		/* 第十八候选：每次上电前清空 SFR，避免读到上一轮的旧崩溃文本 */
+		memset_io((void __iomem *)hdev->sfr.kva, 0, hdev->sfr.size);
+		JOAN_VTRACE("run: sfr cleared %u bytes", hdev->sfr.size);
+	}
+
+	if (joan_clock_config && hdev->core->use_tz &&
+	    of_device_is_compatible(dev->of_node, "qcom,msm8998-venus")) {
+		/* 第二十候选：每次上电（含每次 runtime resume）都要解掉 wrapper 对 ARM9 的时钟门控 */
+		JOAN_VTRACE("run: writel(wrapper+%#x)=0 (every power-on)", WRAPPER_CLOCK_CONFIG);
+		writel(0, hdev->core->wrapper_base + WRAPPER_CLOCK_CONFIG);
+		JOAN_VTRACE("run: WRAPPER_CLOCK_CONFIG=0 posted");
+	}
+
+	JOAN_VTRACE("run: base=%px cpu_cs=%px wrapper=%px ifaceq_da=%#llx sfr_da=%#llx shq=%#x",
+		    hdev->core->base, cpu_cs_base, hdev->core->wrapper_base,
+		    (unsigned long long)hdev->ifaceq_table.da,
+		    (unsigned long long)hdev->sfr.da,
+		    (unsigned int)SHARED_QSIZE);
+
+	venus_vbif_clk_force_on(hdev->core);
+
 	/*
 	 * Re-program all of the registers that get reset as a result of
 	 * regulator_disable() and _enable()
 	 */
 	venus_set_registers(hdev);
+	JOAN_VTRACE("run: set_registers returned");
 
 	writel(hdev->ifaceq_table.da, cpu_cs_base + UC_REGION_ADDR);
 	writel(SHARED_QSIZE, cpu_cs_base + UC_REGION_SIZE);
 	writel(hdev->ifaceq_table.da, cpu_cs_base + CPU_CS_SCIACMDARG2);
+	JOAN_VTRACE("run: uc_region+size+arg2 written");
 	writel(0x01, cpu_cs_base + CPU_CS_SCIACMDARG1);
+	JOAN_VTRACE("run: arg1=0x01 written");
 	if (hdev->sfr.da)
 		writel(hdev->sfr.da, cpu_cs_base + SFR_ADDR);
+	ret = joan_venus_publish_check(hdev);
+	if (ret)
+		return ret;
+	JOAN_VTRACE("run: before venus_boot_core");
 
 	ret = venus_boot_core(hdev);
 	if (ret) {
@@ -625,6 +1024,11 @@ skip_aon_mvp_noc:
 		return 0;
 	}
 
+	if (!joan_vbif_write) {
+		JOAN_VTRACE("halt_axi: SKIPPED VBIF (joan_vbif_write=0, 不碰 VBIF 窗)");
+		return 0;
+	}
+
 	/* Halt AXI and AXI IMEM VBIF Access */
 	val = readl(vbif_base + VBIF_AXI_HALT_CTRL0);
 	val |= VBIF_AXI_HALT_CTRL0_HALT_REQ;
@@ -670,11 +1074,21 @@ static int venus_power_on(struct venus_hfi_device *hdev)
 	if (hdev->power_enabled)
 		return 0;
 
+	JOAN_VTRACE("power_on: before set_hw_state_resume");
 	ret = venus_set_hw_state_resume(hdev->core);
+	JOAN_VTRACE("power_on: set_hw_state_resume ret=%d", ret);
 	if (ret)
 		goto err;
+	ret = joan_venus_hwversion_probe(hdev->core, "C-after-remote-state");
+	if (ret)
+		goto err_suspend;
 
+	JOAN_VTRACE("power_on: before venus_run");
+	/* 保留显式历史开关，默认不访问 VBIF。 */
+	venus_vbif_clk_force_on(hdev->core);
 	ret = venus_run(hdev);
+	JOAN_VTRACE("power_on: venus_run ret=%d", ret);
+	joan_venus_mmcc_probe("C-post-run");
 	if (ret)
 		goto err_suspend;
 
@@ -1226,6 +1640,11 @@ static int venus_session_init(struct venus_inst *inst, u32 session_type,
 	struct venus_hfi_device *hdev = to_hfi_priv(inst->core);
 	struct hfi_session_init_pkt pkt;
 	int ret;
+
+	if (inst->joan_owns_warm)
+		joan_tlog("[warm-hdev] state=%u power=%u suspended=%u core=%u\n",
+			  hdev->state, hdev->power_enabled, hdev->suspended,
+			  inst->core->state);
 
 	ret = venus_sys_set_debug(hdev, venus_fw_debug);
 	if (ret)

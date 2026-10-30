@@ -6,6 +6,7 @@
 #include <linux/device.h>
 #include <linux/firmware.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/of.h>
@@ -20,10 +21,39 @@
 #include "core.h"
 #include "firmware.h"
 #include "hfi_venus_io.h"
+#include <linux/delay.h>
+
+void joan_tlog(const char *fmt, ...);
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
+
 
 #define VENUS_PAS_ID			9
 #define VENUS_FW_MEM_SIZE		(6 * SZ_1M)
 #define VENUS_FW_START_ADDR		0x0
+
+/*
+ * ★ 第十七候选（2026-10-26）：只写 WRAPPER_CLOCK_CONFIG(0xe0004)=0
+ *
+ * 依据：下游 msm8998 vidc 每次上电、时钟使能后、PAS 之前都写
+ *   VIDC_WRAPPER_CLOCK_CONFIG(0xe0004)     = 0
+ *   VIDC_WRAPPER_CPU_CLOCK_CONFIG(0xe2000) = 0
+ * 主线定义了 WRAPPER_CLOCK_CONFIG(hfi_venus_io.h:98) 却在全驱动里从未使用；
+ * 0xe2000 已由第十六候选实读 = 0（故本候选只补 0x04）。
+ *
+ * 0 = 关闭（默认）；1 = PAS 前纯 posted 写（不复读，最安全）；
+ * 2 = 读→写→读（多拿一个初值，但多一次同页读）。
+ * 注意：0xe1020-0xe1034 属 VBIF 域，读即形态 B（已实测），本候选绝不触碰。
+ */
+extern unsigned int joan_clock_config;	/* 定义与 module_param 在 hfi_venus.c */
 
 static void venus_reset_cpu(struct venus_core *core)
 {
@@ -58,15 +88,21 @@ int venus_set_hw_state(struct venus_core *core, bool resume)
 {
 	int ret;
 
+	JOAN_VTRACE("set_hw_state: enter resume=%d use_tz=%u", resume, core->use_tz);
+
 	if (core->use_tz) {
+		JOAN_VTRACE("set_hw_state: before remote_state state=%d id=0", resume);
 		ret = qcom_scm_set_remote_state(resume, 0);
+		JOAN_VTRACE("set_hw_state: remote_state raw_ret=%d", ret);
 		if (resume && ret == -EINVAL)
 			ret = 0;
 		return ret;
 	}
 
 	if (resume) {
+		JOAN_VTRACE("set_hw_state: before venus_reset_cpu");
 		venus_reset_cpu(core);
+		JOAN_VTRACE("set_hw_state: after venus_reset_cpu");
 	} else {
 		if (IS_IRIS2(core) || IS_IRIS2_1(core))
 			writel(WRAPPER_XTSS_SW_RESET_BIT,
@@ -107,7 +143,9 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
 		return -EINVAL;
 	}
 
+	JOAN_VTRACE("load_fw: request_firmware(%s)", fwname);
 	ret = request_firmware(&mdt, fwname, dev);
+	JOAN_VTRACE("load_fw: request_firmware ret=%d", ret);
 	if (ret < 0)
 		return ret;
 
@@ -132,12 +170,15 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
 		goto err_release_fw;
 	}
 
+	JOAN_VTRACE("load_fw: before mdt_load use_tz=%u fw_size=%zd rmem=%pa/%#zx",
+		    core->use_tz, fw_size, mem_phys, *mem_size);
 	if (core->use_tz)
 		ret = qcom_mdt_load(dev, mdt, fwname, VENUS_PAS_ID,
 				    mem_va, *mem_phys, *mem_size, NULL);
 	else
 		ret = qcom_mdt_load_no_init(dev, mdt, fwname, mem_va,
 					    *mem_phys, *mem_size, NULL);
+	JOAN_VTRACE("load_fw: mdt_load ret=%d", ret);
 
 	memunmap(mem_va);
 err_release_fw:
@@ -235,7 +276,10 @@ int venus_boot(struct venus_core *core)
 	if (ret)
 		fwpath = core->res->fwname;
 
+	JOAN_VTRACE("boot: fwpath=%s", fwpath);
 	ret = venus_load_fw(core, fwpath, &mem_phys, &mem_size);
+	JOAN_VTRACE("boot: venus_load_fw ret=%d mem_phys=%pa mem_size=%#zx",
+		    ret, &mem_phys, mem_size);
 	if (ret) {
 		dev_err(dev, "fail to load video firmware\n");
 		return -EINVAL;
@@ -244,10 +288,39 @@ int venus_boot(struct venus_core *core)
 	core->fw.mem_size = mem_size;
 	core->fw.mem_phys = mem_phys;
 
+	if (core->use_tz &&
+	    of_device_is_compatible(dev->of_node, "qcom,msm8998-venus")) {
+		JOAN_VTRACE("boot: pre-PAS CPU_CGC_DIS before writel reg=%#x val=0",
+			    WRAPPER_BASE + WRAPPER_CPU_CGC_DIS);
+		writel(0, core->wrapper_base + WRAPPER_CPU_CGC_DIS);
+		JOAN_VTRACE("boot: pre-PAS CPU_CGC_DIS posted write returned");
+
+		/* 第十七候选：补下游 power-on 末尾的 WRAPPER_CLOCK_CONFIG=0 */
+		if (joan_clock_config) {
+			if (joan_clock_config >= 2) {
+				JOAN_VTRACE("clkcfg: before readl(wrapper+%#x)",
+					    WRAPPER_CLOCK_CONFIG);
+				JOAN_VTRACE("clkcfg: value_before=%#x",
+					    readl(core->wrapper_base +
+						  WRAPPER_CLOCK_CONFIG));
+			}
+			JOAN_VTRACE("clkcfg: before writel(wrapper+%#x)=0",
+				    WRAPPER_CLOCK_CONFIG);
+			writel(0, core->wrapper_base + WRAPPER_CLOCK_CONFIG);
+			JOAN_VTRACE("clkcfg: posted write returned");
+			if (joan_clock_config >= 2)
+				JOAN_VTRACE("clkcfg: value_after=%#x",
+					    readl(core->wrapper_base +
+						  WRAPPER_CLOCK_CONFIG));
+		}
+	}
+
+	JOAN_VTRACE("boot: before pas_auth_and_reset(9) use_tz=%u", core->use_tz);
 	if (core->use_tz)
 		ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
 	else
 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
+	JOAN_VTRACE("boot: pas_auth_and_reset ret=%d", ret);
 
 	if (ret)
 		return ret;
@@ -263,12 +336,21 @@ int venus_boot(struct venus_core *core)
 		 * cp_nonpixel_start = venus_sec_non_pixel/virtual-addr-pool[0]
 		 * cp_nonpixel_size = venus_sec_non_pixel/virtual-addr-pool[1]
 		 */
+		pr_info("joan-venus-trace: boot: before mem_protect_video_var cp=%#x/%#x nonpixel=%#x/%#x\n",
+			res->cp_start, res->cp_size,
+			res->cp_nonpixel_start, res->cp_nonpixel_size);
 		ret = qcom_scm_mem_protect_video_var(res->cp_start,
 						     res->cp_size,
 						     res->cp_nonpixel_start,
 						     res->cp_nonpixel_size);
+		pr_info("joan-venus-trace: boot: mem_protect_video_var ret=%d\n", ret);
 		if (ret) {
-			qcom_scm_pas_shutdown(VENUS_PAS_ID);
+			int shutdown_ret;
+
+			pr_info("joan-venus-trace: boot: before CP error pas_shutdown(9)\n");
+			shutdown_ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
+			pr_info("joan-venus-trace: boot: CP error pas_shutdown ret=%d\n",
+				shutdown_ret);
 			dev_err(dev, "set virtual address ranges fail (%d)\n",
 				ret);
 			return ret;
@@ -321,8 +403,10 @@ int venus_firmware_init(struct venus_core *core)
 	np = of_get_child_by_name(core->dev->of_node, "video-firmware");
 	if (!np) {
 		core->use_tz = true;
+		JOAN_VTRACE("firmware_init: no video-firmware node -> use_tz=1");
 		return 0;
 	}
+	JOAN_VTRACE("firmware_init: video-firmware node present -> use_tz=0");
 
 	memset(&info, 0, sizeof(info));
 	info.fwnode = &np->fwnode;

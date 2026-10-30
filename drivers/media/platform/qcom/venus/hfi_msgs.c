@@ -4,6 +4,18 @@
  * Copyright (C) 2017 Linaro Ltd.
  */
 #include <linux/hash.h>
+
+extern unsigned int joan_trace_quiet;
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/smem.h>
@@ -13,6 +25,7 @@
 #include "hfi.h"
 #include "hfi_helper.h"
 #include "hfi_msgs.h"
+#include "helpers.h"
 #include "hfi_parser.h"
 
 #define SMEM_IMG_VER_TBL	469
@@ -48,7 +61,6 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 		inst->ops->event_notify(inst, EVT_SYS_EVENT_CHANGE, &event);
 		return;
 	}
-
 	event.event_type = pkt->event_data1;
 
 	num_properties_changed = pkt->event_data2;
@@ -65,7 +77,6 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 
 		data_ptr += sizeof(u32);
 		rem_bytes -= sizeof(u32);
-
 		switch (ptype) {
 		case HFI_PROPERTY_PARAM_FRAME_SIZE:
 			if (rem_bytes < sizeof(struct hfi_framesize))
@@ -152,6 +163,9 @@ static void event_seq_changed(struct venus_core *core, struct venus_inst *inst,
 		num_properties_changed--;
 	} while (num_properties_changed > 0);
 
+	JOAN_VTRACE("seq_change: ev=%#x w=%u h=%u profile=%u level=%u props_left=%d",
+		    event.event_type, event.width, event.height,
+		    event.profile, event.level, num_properties_changed);
 	inst->ops->event_notify(inst, EVT_SYS_EVENT_CHANGE, &event);
 	return;
 
@@ -229,6 +243,21 @@ static void hfi_event_notify(struct venus_core *core, struct venus_inst *inst,
 
 	if (!packet)
 		return;
+
+	JOAN_VTRACE("event_notify: id=%#x data1=%#x data2=%#x",
+		    pkt->event_id, pkt->event_data1, pkt->event_data2);
+
+	/*
+	 * 上面的分发表对 EVENT_NOTIFY 在 instance 无效时是放行的
+	 * （SYS_ERROR 本来就没有会话）。但 SESSION_ERROR /
+	 * SESSION_SEQUENCE_CHANGED / RELEASE_BUFFER_REFERENCE 都是会话级事件，
+	 * 处理器会解引用 inst —— 传 NULL 就是空指针解引用。
+	 */
+	if (!inst && pkt->event_id != HFI_EVENT_SYS_ERROR) {
+		dev_warn(core->dev, "joan: 会话级事件 %#x 但 instance 无效，丢弃\n",
+			 pkt->event_id);
+		return;
+	}
 
 	switch (pkt->event_id) {
 	case HFI_EVENT_SYS_ERROR:
@@ -518,6 +547,7 @@ static void hfi_session_load_res_done(struct venus_core *core,
 	struct hfi_msg_session_load_resources_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	joan_tlog("[load_res] err=%u\n", pkt->error_type);
 	complete(&inst->done);
 }
 
@@ -538,6 +568,17 @@ static void hfi_session_etb_done(struct venus_core *core,
 	struct hfi_msg_session_empty_buffer_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	if (joan_enc_recover && pkt->error_type == 0x1002 &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    !inst->joan_recovered) {
+		inst->joan_recovered = true;
+		schedule_work(&inst->joan_rec_work);
+		joan_tlog("[rec] 首个 0x1002，安排会话重建\n");
+	}
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("etb_done: sess=%u tag=%u filled=%u err=%u",
+		    inst->session_type, pkt->input_tag, pkt->filled_len,
+		    pkt->error_type);
 	inst->ops->buf_done(inst, HFI_BUFFER_INPUT, pkt->input_tag,
 			    pkt->filled_len, pkt->offset, 0, 0, 0);
 }
@@ -551,6 +592,15 @@ static void hfi_session_ftb_done(struct venus_core *core,
 	unsigned int error;
 	u32 flags = 0, hfi_flags = 0, offset = 0, filled_len = 0;
 	u32 pic_type = 0, buffer_type = 0, output_tag = -1;
+	const u32 *__raw = packet;
+
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("ftb_raw: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+		    __raw[0], __raw[1], __raw[2], __raw[3], __raw[4], __raw[5],
+		    __raw[6], __raw[7], __raw[8], __raw[9], __raw[10], __raw[11],
+		    __raw[12], __raw[13], __raw[14], __raw[15], __raw[16], __raw[17],
+		    __raw[18], __raw[19], __raw[20], __raw[21], __raw[22], __raw[23],
+		    __raw[24], __raw[25], __raw[26], __raw[27]);
 
 	if (session_type == VIDC_SESSION_TYPE_ENC) {
 		struct hfi_msg_session_fbd_compressed_pkt *pkt = packet;
@@ -619,6 +669,10 @@ static void hfi_session_ftb_done(struct venus_core *core,
 
 done:
 	inst->error = error;
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("ftb_done: sess=%u btype=%u tag=%u filled=%u err=%u hfi_flags=%#x pic=%#x v4l2_flags=%#x",
+		    session_type, buffer_type, output_tag, filled_len, error,
+		    hfi_flags, pic_type, flags);
 	inst->ops->buf_done(inst, buffer_type, output_tag, filled_len,
 			    offset, flags, hfi_flags, timestamp_us);
 }
@@ -629,6 +683,7 @@ static void hfi_session_start_done(struct venus_core *core,
 	struct hfi_msg_session_start_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	joan_tlog("[start] err=%u\n", pkt->error_type);
 	complete(&inst->done);
 }
 
@@ -638,6 +693,7 @@ static void hfi_session_stop_done(struct venus_core *core,
 	struct hfi_msg_session_stop_done_pkt *pkt = packet;
 
 	inst->error = pkt->error_type;
+	joan_tlog("[stop] err=%u\n", pkt->error_type);
 	complete(&inst->done);
 }
 
@@ -795,7 +851,7 @@ static struct venus_inst *to_instance(struct venus_core *core, u32 session_id)
 
 	mutex_lock(&core->lock);
 	list_for_each_entry(inst, &core->instances, list)
-		if (hash32_ptr(inst) == session_id) {
+		if (inst->id == session_id) {
 			mutex_unlock(&core->lock);
 			return inst;
 		}
@@ -819,6 +875,9 @@ u32 hfi_process_msg_packet(struct venus_core *core, struct hfi_pkt_hdr *hdr)
 		found = true;
 		break;
 	}
+
+	if (!joan_trace_quiet)
+		JOAN_VTRACE("msg: pkt_type=%#x size=%u found=%d", hdr->pkt_type, hdr->size, found);
 
 	if (!found)
 		return hdr->pkt_type;

@@ -3230,7 +3230,15 @@
 				 <&mmss_smmu 0x42c>,
 				 <&mmss_smmu 0x42d>,
 				 <&mmss_smmu 0x411>,
-				 <&mmss_smmu 0x431>;
+				 <&mmss_smmu 0x431>,
+				 /*
+				  * 固件（ARM9）访问用的 SID：下游 msm8998-vidc.dtsi 的
+				  * firmware_cb 就是 <&mmss_smmu 0x580>, <&mmss_smmu 0x586>。
+				  * 主线 use_tz 路径下这两个 SID 原本无人映射，纳入 Venus 的
+				  * IOMMU 域后固件才能通过 SMMU 读 HFI 队列与其内部数据。
+				  */
+				 <&mmss_smmu 0x580>,
+				 <&mmss_smmu 0x586>;
 			memory-region = <&venus_mem>;
 			status = "disabled";
 

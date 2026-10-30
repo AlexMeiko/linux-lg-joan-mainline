@@ -305,6 +305,16 @@
 	status = "okay";
 };
 
+/*
+ * Venus 硬件编解码（2026-10-10 重开）：DT 节点启用，但模块在设备侧由
+ * /etc/modprobe.d/blacklist-venus.conf 挡住，不让 udev 在启动期自动 probe
+ * —— r88 曾因自动 probe 触发 qcom_scm_pas_auth_and_reset() 造成启动期硬复位，
+ * 见 note.md §16。人工 modprobe 时才真正上电。
+ */
+&venus {
+	status = "okay";
+};
+
 &pm8998_gpios {
 	volume_up_default: volume-up-state {
 		pins = "gpio6";

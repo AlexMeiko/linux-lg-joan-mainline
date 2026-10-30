@@ -3,6 +3,7 @@
  * Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  * Copyright (C) 2017 Linaro Ltd.
  */
+#include <linux/clk.h>
 #include <linux/init.h>
 #include <linux/interconnect.h>
 #include <linux/io.h>
@@ -11,7 +12,14 @@
 #include <linux/devcoredump.h>
 #include <linux/list.h>
 #include <linux/module.h>
+
+/* 候选 50：禁止运行时挂起（临时稳定化开关）*/
+unsigned int joan_no_rpm = 1;
+
+/* 候选 36b：收到 HFI 系统错误后不做恢复（避免实验时把内核卡死） */
+unsigned int joan_no_recover;
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -27,6 +35,19 @@
 #include "firmware.h"
 #include "pm_helpers.h"
 #include "hfi_venus_io.h"
+
+void joan_tlog(const char *fmt, ...);
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
+
 
 static void venus_coredump(struct venus_core *core)
 {
@@ -89,6 +110,14 @@ static void venus_sys_error_handler(struct work_struct *work)
 	struct venus_core *core =
 			container_of(work, struct venus_core, work.work);
 	int ret, i, max_attempts = RPM_WAIT_FOR_IDLE_MAX_ATTEMPTS;
+
+	hfi_joan_drop_warm_encoder(core);
+
+	if (joan_no_recover) {
+		JOAN_VTRACE("sys_error: joan_no_recover=1, skip recovery");
+		core->state = CORE_UNINIT;
+		return;
+	}
 	const char *err_msg = "";
 	bool failed = false;
 
@@ -103,7 +132,14 @@ static void venus_sys_error_handler(struct work_struct *work)
 	core->state = CORE_UNINIT;
 
 	for (i = 0; i < max_attempts; i++) {
-		if (!pm_runtime_active(core->dev_dec) && !pm_runtime_active(core->dev_enc))
+		/*
+		 * joan 修复：decoder/encoder 视频设备是各自模块 probe 时才注册的，
+		 * 只加载 venus-dec（或只加载 venus-enc）时另一个指针为 NULL。
+		 * 原代码直接 pm_runtime_active() 会空指针，把整个内核拖死
+		 * （实测 oops 在 venus_sys_error_handler+0x74，ldr w1,[x0,#0x19c]）。
+		 */
+		if ((!core->dev_dec || !pm_runtime_active(core->dev_dec)) &&
+		    (!core->dev_enc || !pm_runtime_active(core->dev_enc)))
 			break;
 		msleep(10);
 	}
@@ -140,13 +176,19 @@ static void venus_sys_error_handler(struct work_struct *work)
 		failed = true;
 	}
 
+	/*
+	 * IRQ 必须在 hfi_core_resume() 之前恢复。
+	 * hfi_core_resume() 会发 SYS_INIT 并 wait_for_completion()，而那个
+	 * completion 只有 ISR 收到 SYS_INIT_DONE 才会触发。原来 enable_irq()
+	 * 排在它后面 —— IRQ 关着，响应永远收不到，这里必然超时。
+	 */
+	enable_irq(core->irq);
+
 	ret = hfi_core_resume(core, true);
 	if (ret && !failed) {
 		err_msg = "resume HFI";
 		failed = true;
 	}
-
-	enable_irq(core->irq);
 
 	mutex_unlock(&core->lock);
 
@@ -374,11 +416,297 @@ static int venus_add_dynamic_nodes(struct venus_core *core)
 static void venus_remove_dynamic_nodes(struct venus_core *core) {}
 #endif
 
+/* 只读 MMCC，避免错误清理前隐式访问 Venus/VBIF 寄存器。 */
+void joan_venus_mmcc_probe(const char *tag)
+{
+	struct device_node *np;
+	void __iomem *mmcc;
+
+	np = of_find_compatible_node(NULL, NULL, "qcom,mmcc-msm8998");
+	if (!np) {
+		JOAN_VTRACE("mmcc[%s]: node not found", tag);
+	} else {
+		mmcc = of_iomap(np, 0);
+		of_node_put(np);
+		if (!mmcc) {
+			JOAN_VTRACE("mmcc[%s]: of_iomap failed", tag);
+		} else {
+			JOAN_VTRACE("mmcc[%s]: gdscr(0x1024)=%#x core(0x1028)=%#x ahb(0x1030)=%#x axi(0x1034)=%#x maxi(0x1038)=%#x",
+				    tag, readl(mmcc + 0x1024), readl(mmcc + 0x1028),
+				    readl(mmcc + 0x1030), readl(mmcc + 0x1034),
+				    readl(mmcc + 0x1038));
+			iounmap(mmcc);
+		}
+	}
+}
+
+static void joan_probe_branch(void __iomem *base, u32 off, const char *name,
+			      const char *tag)
+{
+	u32 value = readl(base + off);
+
+	JOAN_VTRACE("clk[%s]: %-26s off=%#06x value=%#010x read-only",
+		    tag, name, off, value);
+}
+
+/* 时钟由 CCF 管理；取证不得直接写 CBCR 绕过引用计数。 */
+static void joan_venus_clk_probe(const char *tag)
+{
+	struct device_node *np;
+	void __iomem *mmcc, *gcc;
+
+	np = of_find_compatible_node(NULL, NULL, "qcom,mmcc-msm8998");
+	if (!np) {
+		JOAN_VTRACE("clk[%s]: no mmcc node", tag);
+	} else {
+		mmcc = of_iomap(np, 0);
+		of_node_put(np);
+		if (!mmcc) {
+			JOAN_VTRACE("clk[%s]: mmcc iomap failed", tag);
+		} else {
+			joan_probe_branch(mmcc, 0x5024, "mmcc:mnoc_ahb", tag);
+			joan_probe_branch(mmcc, 0xf004, "mmcc:mnoc_maxi", tag);
+			joan_probe_branch(mmcc, 0xf064, "mmcc:vmem_maxi", tag);
+			joan_probe_branch(mmcc, 0xf068, "mmcc:vmem_ahb", tag);
+			joan_probe_branch(mmcc, 0x1024, "mmcc:video_top_gdscr", tag);
+			iounmap(mmcc);
+		}
+	}
+
+	np = of_find_compatible_node(NULL, NULL, "qcom,gcc-msm8998");
+	if (!np) {
+		JOAN_VTRACE("clk[%s]: no gcc node", tag);
+		return;
+	}
+	gcc = of_iomap(np, 0);
+	of_node_put(np);
+	if (!gcc) {
+		JOAN_VTRACE("clk[%s]: gcc iomap failed", tag);
+		return;
+	}
+	/* gcc 侧只读：dtsi 明确警告写 gcc 受保护时钟可能触发复位 */
+	joan_probe_branch(gcc, 0x9000, "gcc:mmss_sys_noc_axi", tag);
+	joan_probe_branch(gcc, 0x9004, "gcc:mmss_noc_cfg_ahb", tag);
+	iounmap(gcc);
+}
+
+static void joan_venus_supplier_probe(struct venus_core *core, const char *tag)
+{
+#ifdef CONFIG_PM
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct device *supplier;
+	enum rpm_status status;
+	unsigned long flags;
+	bool enabled;
+	int usage;
+
+	np = of_parse_phandle(core->dev->of_node, "iommus", 0);
+	if (!np) {
+		pr_info("joan-venus-trace: supplier[%s]: no IOMMU node\n", tag);
+		return;
+	}
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev) {
+		pr_info("joan-venus-trace: supplier[%s]: no IOMMU device\n", tag);
+		return;
+	}
+
+	/* Read software state without taking a runtime PM usage reference. */
+	supplier = &pdev->dev;
+	spin_lock_irqsave(&supplier->power.lock, flags);
+	status = supplier->power.runtime_status;
+	enabled = pm_runtime_enabled(supplier);
+	usage = atomic_read(&supplier->power.usage_count);
+	spin_unlock_irqrestore(&supplier->power.lock, flags);
+	pr_info("joan-venus-trace: supplier[%s]: %s rpm_status=%u enabled=%u usage=%d\n",
+		tag, dev_name(supplier), (unsigned int)status, enabled, usage);
+	put_device(supplier);
+#endif
+}
+
+/* 仅验证已知的硬件版本寄存器；不能把全零窗口解释为 ARM9 状态。 */
+int joan_venus_hwversion_probe(struct venus_core *core, const char *tag)
+{
+	u32 version;
+
+	if (!of_device_is_compatible(core->dev->of_node, "qcom,msm8998-venus"))
+		return 0;
+
+	JOAN_VTRACE("hwver[%s]: before readl(wrapper+%#x)", tag,
+		    WRAPPER_HW_VERSION);
+	version = readl(core->wrapper_base + WRAPPER_HW_VERSION);
+	JOAN_VTRACE("hwver[%s]: value=%#x", tag, version);
+
+	if ((version & WRAPPER_HW_VERSION_MAJOR_VERSION_MASK) !=
+	    (3U << WRAPPER_HW_VERSION_MAJOR_VERSION_SHIFT)) {
+		dev_err(core->dev, "invalid Venus 3.x MMIO window at %s (%#x)\n",
+			tag, version);
+		return -EIO;
+	}
+
+	joan_venus_supplier_probe(core, tag);
+	return 0;
+}
+
+/*
+ * 取证辅助：按模块参数给的地址列表逐个读 venus 寄存器块。
+ *   joan_probe_list="0x80004,0x80000"   —— 逗号分隔的十六进制偏移
+ *   joan_probe_write=1                  —— 每个偏移先读，再把 bit0 置 1 写回再读
+ * 设了 joan_probe_list 时，probe 在扫完后直接返回 -ENODEV（只做扫描）。
+ * 每条标记独立打印，便于按最后一条 before 定位未返回的读取。
+ */
+static char *joan_probe_list;
+
+static bool joan_probe_write;
+
+/*
+ * joan_probe_poke="0x80004=0x1" —— 逗号分隔的 off=val（都按 16 进制），
+ * 在每个值上做一次 **纯写**（posted，不复读），用于验证「必须先写某寄存器
+ * 才能让寄存器块响应」这类假设。下游 msm-4.4 venus_boot.c 原文：
+ *   "Force the VBIF clk to be on to avoid AXI bridge halt ack failure"
+ *   reg = readl_relaxed(reg_base + VIDC_VENUS_VBIF_CLK_ON);  reg |= FORCE_ON;
+ */
+static char *joan_probe_poke;
+
+/*
+ * joan_vbif_forceon=1 —— A/B 开关：probe 里 pm_runtime_get_sync 之后是否立刻
+ * 对 VBIF_CLK_ON 写 FORCE_ON。默认关（见调用点注释）。
+ */
+static bool joan_vbif_forceon;
+
+/* 1：仅上电和 HW_VERSION；2：PAS 后退出；0：继续原有 probe。 */
+static unsigned int joan_probe_stop;
+
+/*
+ * joan_noc_clks=1 —— H9 实验：下游 msm8998 vidc 每个上电周期要开 12 个时钟，
+ * mainline 只开 4 个（core/iface/bus/mbus）。VBIF 挂在 MMSS NoC 上，
+ * 若 NoC 侧时钟（mnoc_ahb / gcc mmss_sys_noc_axi / bimc_smmu_*）没开，
+ * 访问 VBIF 寄存器窗就会挂死互连。
+ *
+ * 这里用 clk_get(NULL, "<全局时钟名>") 直接取来开，**不动 DT/驱动资源表**，
+ * 目的是用最小改动做单变量验证。
+ */
+static bool joan_noc_clks;
+
+static const char * const joan_noc_clk_names[] = {
+	"gcc_mmss_sys_noc_axi_clk",
+	"gcc_mmss_noc_cfg_ahb_clk",
+	"mnoc_ahb_clk",
+	"mnoc_maxi_clk",
+	"bimc_smmu_ahb_clk",
+	"bimc_smmu_axi_clk",
+	"vmem_ahb_clk",
+	"vmem_maxi_clk",
+};
+
+static void joan_noc_clk_enable(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(joan_noc_clk_names); i++) {
+		const char *n = joan_noc_clk_names[i];
+		struct clk *c = clk_get(NULL, n);
+		int ret;
+
+		if (IS_ERR(c)) {
+			JOAN_VTRACE("noc_clk: %s clk_get err %ld", n, PTR_ERR(c));
+			continue;
+		}
+		ret = clk_prepare_enable(c);
+		JOAN_VTRACE("noc_clk: %s rate=%lu prepare_enable ret=%d",
+			    n, clk_get_rate(c), ret);
+		/* 故意不 clk_put：诊断用，保持住引用直到下次重启 */
+	}
+}
+
+static void joan_venus_addr_poke(struct venus_core *core)
+{
+	char *buf, *p, *tok;
+
+	if (!joan_probe_poke)
+		return;
+
+	buf = kstrdup(joan_probe_poke, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	p = buf;
+	while ((tok = strsep(&p, ",")) != NULL) {
+		char *eq;
+		unsigned int off, val;
+
+		if (!*tok)
+			continue;
+		eq = strchr(tok, '=');
+		if (!eq)
+			continue;
+		*eq++ = '\0';
+		if (kstrtouint(tok, 16, &off) || kstrtouint(eq, 16, &val)) {
+			JOAN_VTRACE("poke: bad token");
+			continue;
+		}
+
+		JOAN_VTRACE("poke: before writel(base+%#08x, %#010x) [posted]", off, val);
+		writel_relaxed(val, core->base + off);
+		JOAN_VTRACE("poke: writel done base+%#08x (no readback)", off);
+	}
+
+	kfree(buf);
+}
+
+static void joan_venus_addr_scan(struct venus_core *core)
+{
+	char *buf, *p, *tok;
+
+	if (!joan_probe_list)
+		return;
+
+	buf = kstrdup(joan_probe_list, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	JOAN_VTRACE("scan: list=%s write=%d", joan_probe_list, joan_probe_write);
+
+	p = buf;
+	while ((tok = strsep(&p, ",")) != NULL) {
+		unsigned int off;
+		u32 before, after;
+
+		if (!*tok)
+			continue;
+		if (kstrtouint(tok, 16, &off)) {
+			JOAN_VTRACE("scan: bad token '%s'", tok);
+			continue;
+		}
+
+		JOAN_VTRACE("scan: before readl(base+%#08x)", off);
+		before = readl(core->base + off);
+		JOAN_VTRACE("scan: readl(base+%#08x)=%#010x", off, before);
+
+		if (joan_probe_write) {
+			writel(before | BIT(0), core->base + off);
+			udelay(50);
+			after = readl(core->base + off);
+			JOAN_VTRACE("scan: write(base+%#08x, %#010x) -> %#010x",
+				    off, before | BIT(0), after);
+		}
+	}
+
+	kfree(buf);
+}
+
 static int venus_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct venus_core *core;
-	int ret;
+	bool runtime_resumed = false;
+	bool irq_requested = false;
+	int ret, pm_ret = 0;
+
+	if (joan_probe_stop > 2)
+		return -EINVAL;
 
 	core = devm_kzalloc(dev, sizeof(*core), GFP_KERNEL);
 	if (!core)
@@ -389,6 +717,15 @@ static int venus_probe(struct platform_device *pdev)
 	core->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(core->base))
 		return PTR_ERR(core->base);
+
+	/*
+	 * ★ v2 修正（2026-10-10）：joan_venus_addr_scan() 原先放在这里（上电之前），
+	 * 实测证明「venus 未被 pm_runtime 上电时，任何寄存器访问都会挂死总线」
+	 * ——连已知可读的 wrapper 0xe0000 也不例外，所以那时扫出来的「不可访问」
+	 * 全是假象。扫描改到 pm_runtime_get_sync() 之后（见下面 powered-scan 段）。
+	 */
+
+	joan_venus_clk_probe("pre-probe");
 
 	core->video_path = devm_of_icc_get(dev, "video-mem");
 	if (IS_ERR(core->video_path))
@@ -426,6 +763,7 @@ static int venus_probe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&core->instances);
 	mutex_init(&core->lock);
+	mutex_init(&core->joan_warm_lock);
 	INIT_DELAYED_WORK(&core->work, venus_sys_error_handler);
 	init_waitqueue_head(&core->sys_err_done);
 
@@ -437,7 +775,8 @@ static int venus_probe(struct platform_device *pdev)
 					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
 					"venus", core);
 	if (ret)
-		goto err_core_put;
+		goto err_hfi_destroy;
+	irq_requested = true;
 
 	venus_assign_register_offsets(core);
 
@@ -449,27 +788,92 @@ static int venus_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(dev);
 
+	JOAN_VTRACE("probe: before pm_runtime_get_sync");
 	ret = pm_runtime_get_sync(dev);
+	JOAN_VTRACE("probe: pm_runtime_get_sync ret=%d", ret);
 	if (ret < 0)
 		goto err_runtime_disable;
+	runtime_resumed = true;
 
+	joan_venus_mmcc_probe("A-after-runtime-pm");
+	ret = joan_venus_hwversion_probe(core, "A-after-runtime-pm");
+	if (ret)
+		goto err_runtime_disable;
+	if (joan_probe_stop == 1) {
+		JOAN_VTRACE("probe: diagnostic stop=1 before firmware/TZ");
+		ret = -ECANCELED;
+		goto err_runtime_disable;
+	}
+
+	/*
+	 * ★ 2026-10-10 A/B 开关：上电后（pm_runtime_get_sync 之后）是否立刻对
+	 * VBIF_CLK_ON 做一次 force-on。
+	 *
+	 * 默认**关闭**：实测发现「在 A 点写 base+0x80004」之后，紧接着的
+	 * VBIF 首次读（scan 的 readl(base+0x80000)）会挂死总线；
+	 * 而把这次写交给 joan_probe_poke 去做（同样地址、同样值）时读是通的
+	 * （§16.13.C 可复现）。⇒ 用 joan_vbif_forceon=1 单独打开做对照，
+	 * 确认「A 点写」本身是否就是问题。
+	 */
+	JOAN_VTRACE("probe: vbif_forceon=%d noc_clks=%d vbif_base=%px base=%px",
+		    joan_vbif_forceon, joan_noc_clks, core->vbif_base, core->base);
+	if (joan_noc_clks)
+		joan_noc_clk_enable();
+	if (joan_vbif_forceon && !IS_V6(core) && core->vbif_base) {
+		JOAN_VTRACE("vbif_clk_on[A]: force-on -> %px+%#x",
+			    core->vbif_base, VBIF_CLK_ON);
+		writel(VBIF_CLK_ON_FORCE_ON, core->vbif_base + VBIF_CLK_ON);
+		JOAN_VTRACE("vbif_clk_on[A]: posted write returned");
+	}
+
+	/*
+	 * ★ powered-scan：此时 GDSC + 4 路 video 时钟已开，扫描结果才有效。
+	 * 设了 joan_probe_list 时扫完就退出（走正常错误回收路径）。
+	 * 先跑 joan_probe_poke（纯写，用于验证「必须先写才响应」的假设）。
+	 */
+	joan_venus_addr_poke(core);
+	joan_venus_addr_scan(core);
+	if (joan_probe_list) {
+		ret = -ENODEV;
+		goto err_runtime_disable;
+	}
+
+	JOAN_VTRACE("probe: before venus_firmware_init");
 	ret = venus_firmware_init(core);
+	JOAN_VTRACE("probe: venus_firmware_init ret=%d use_tz=%u", ret, core->use_tz);
 	if (ret)
 		goto err_runtime_disable;
 
+	JOAN_VTRACE("probe: before venus_boot");
 	ret = venus_boot(core);
+	JOAN_VTRACE("probe: venus_boot ret=%d", ret);
 	if (ret)
 		goto err_firmware_deinit;
 
+	ret = joan_venus_hwversion_probe(core, "B-after-PAS");
+	if (ret)
+		goto err_venus_shutdown;
+	if (joan_probe_stop == 2) {
+		JOAN_VTRACE("probe: diagnostic stop=2 before remote state/HFI");
+		ret = -ECANCELED;
+		goto err_venus_shutdown;
+	}
+
+	JOAN_VTRACE("probe: before venus_firmware_cfg");
 	ret = venus_firmware_cfg(core);
+	JOAN_VTRACE("probe: venus_firmware_cfg ret=%d", ret);
 	if (ret)
 		goto err_venus_shutdown;
 
+	JOAN_VTRACE("probe: before hfi_core_resume");
 	ret = hfi_core_resume(core, true);
+	JOAN_VTRACE("probe: hfi_core_resume ret=%d", ret);
 	if (ret)
 		goto err_venus_shutdown;
 
+	JOAN_VTRACE("probe: before hfi_core_init");
 	ret = hfi_core_init(core);
+	JOAN_VTRACE("probe: hfi_core_init ret=%d", ret);
 	if (ret)
 		goto err_venus_shutdown;
 
@@ -495,6 +899,20 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_of_depopulate;
 
+	ret = hfi_joan_prewarm_encoder(core);
+	if (ret)
+		goto err_of_depopulate;
+
+	/*
+	 * 候选 50（临时稳定化开关）：msm8998 上「空闲掉电 -> 恢复」路径仍然会触发
+	 * 固件 System error（power_on/boot_core 都返回 0，随后报错并无法恢复）。
+	 * joan_no_rpm=1 时禁止运行时挂起，核心保持上电，换取稳定；
+	 * 默认 0，等恢复路径修好后再打开。
+	 */
+	if (joan_no_rpm) {
+		pm_runtime_forbid(dev);
+		JOAN_VTRACE("probe: runtime PM forbidden (joan_no_rpm=1)");
+	}
 	ret = pm_runtime_put_sync(dev);
 	if (ret) {
 		pm_runtime_get_noresume(dev);
@@ -506,21 +924,42 @@ static int venus_probe(struct platform_device *pdev)
 	return 0;
 
 err_of_depopulate:
+	hfi_joan_drop_warm_encoder(core);
 	of_platform_depopulate(dev);
 err_remove_dynamic_nodes:
 	venus_remove_dynamic_nodes(core);
 err_core_deinit:
 	hfi_core_deinit(core, false);
 err_venus_shutdown:
-	venus_shutdown(core);
+	/* 先移除 IRQ，防止固件关闭或掉电时 handler 继续访问 MMIO。 */
+	devm_free_irq(dev, core->irq, core);
+	irq_requested = false;
+	JOAN_VTRACE("probe: before error venus_shutdown");
+	pm_ret = venus_shutdown(core);
+	JOAN_VTRACE("probe: error venus_shutdown ret=%d", pm_ret);
 err_firmware_deinit:
 	venus_firmware_deinit(core);
 err_runtime_disable:
-	pm_runtime_put_noidle(dev);
+	if (irq_requested) {
+		devm_free_irq(dev, core->irq, core);
+		irq_requested = false;
+	}
+	if (runtime_resumed) {
+		/* CORE_UNINIT 下不会等待 HFI；正常关闭 clocks，再交给 genpd。 */
+		JOAN_VTRACE("probe: before error runtime suspend");
+		pm_ret = pm_runtime_put_sync_suspend(dev);
+		JOAN_VTRACE("probe: error runtime suspend ret=%d active=%d",
+			    pm_ret, pm_runtime_active(dev));
+	} else {
+		pm_runtime_put_noidle(dev);
+	}
 	pm_runtime_disable(dev);
-	pm_runtime_set_suspended(dev);
+	if (!runtime_resumed || pm_ret >= 0)
+		pm_runtime_set_suspended(dev);
 	v4l2_device_unregister(&core->v4l2_dev);
 err_hfi_destroy:
+	if (irq_requested)
+		devm_free_irq(dev, core->irq, core);
 	hfi_destroy(core);
 err_core_put:
 	if (core->pm_ops->core_put)
@@ -539,6 +978,7 @@ static void venus_remove(struct platform_device *pdev)
 	ret = pm_runtime_get_sync(dev);
 	WARN_ON(ret < 0);
 
+	hfi_joan_drop_warm_encoder(core);
 	ret = hfi_core_deinit(core, true);
 	WARN_ON(ret);
 
@@ -756,6 +1196,11 @@ static const struct venus_resources msm8998_res = {
 	.vmem_size = 0,
 	.vmem_addr = 0,
 	.dma_mask = 0xddc00000 - 1,
+	/* MSM8998 downstream venus_ns / venus_sec_non_pixel IOVA pools. */
+	.cp_start = 0,
+	.cp_size = 0x70800000,
+	.cp_nonpixel_start = 0x1000000,
+	.cp_nonpixel_size = 0x24800000,
 	.fwname = "qcom/venus-4.4/venus.mbn",
 };
 

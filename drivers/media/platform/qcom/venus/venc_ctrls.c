@@ -4,6 +4,21 @@
  * Copyright (C) 2017 Linaro Ltd.
  */
 #include <linux/types.h>
+#include <linux/module.h>
+
+unsigned int joan_enc_allow_separate = 1;
+
+unsigned int joan_enc_force_joined = 1;
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
 #include <media/v4l2-ctrls.h>
 
 #include "core.h"
@@ -41,6 +56,14 @@ static int venc_calc_bpframes(u32 gop_size, u32 conseq_b, u32 *bf, u32 *pf)
 	b = p = half;
 
 	for (; b <= gop_size - 1; b++, p--) {
+		/*
+		 * p 递减到 0 时 b % p 是除零。
+		 * 例：GOP=1 → half=0 → 首轮就是 0 % 0；
+		 *     GOP=4、B=2 → 第二轮 p=0。
+		 * 没有可用的 (b,p) 组合时直接退出，由后面的 !found 返回 -EINVAL。
+		 */
+		if (!p)
+			break;
 		if (b % p)
 			continue;
 
@@ -86,12 +109,14 @@ static int dynamic_bitrate_update(struct venus_inst *inst, u32 bitrate,
 
 static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 {
+	JOAN_VTRACE("venc_s_ctrl: id=%#x val=%d", ctrl->id, ctrl->val);
 	struct venus_inst *inst = ctrl_to_inst(ctrl);
 	struct venc_controls *ctr = &inst->controls.enc;
 	struct hfi_enable en = { .enable = 1 };
 	struct hfi_ltr_use ltr_use;
 	struct hfi_ltr_mark ltr_mark;
 	u32 bframes;
+	u32 num_p;
 	u32 ptype;
 	int ret;
 
@@ -217,7 +242,24 @@ static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctr->h264_loop_filter_mode = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
-		ctr->header_mode = ctrl->val;
+		/*
+		 * 候选 45：这个驱动没有实现「单独取序列头」的通道（没有对应的事件/控件
+		 * 把 SPS/PPS 交回用户态）。若允许 ffmpeg 把 header_mode 设成 SEPARATE，
+		 * 产出的码流就没有 SPS/PPS（首字节直接是 0x65 IDR），软件解码器无法解析。
+		 * 因此这里拒绝 SEPARATE，保持 JOINED（SPS/PPS 随第一帧带出）。
+		 */
+		/*
+		 * 候选 99/100：ffmpeg 的 v4l2m2m 编码器会先设 SEPARATE，被拒会让它
+		 * 直接以 -EINVAL 中止（实测软解→硬编整条流水线失败）。这里接受该
+		 * 控件值，但在固件侧仍强制 JOINED（SPS/PPS 随第一帧带出）。
+		 */
+		if (ctrl->val == V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE &&
+		    !joan_enc_allow_separate) {
+			JOAN_VTRACE("venc_s_ctrl: HEADER_MODE=SEPARATE rejected");
+			return -EINVAL;
+		}
+		ctr->header_mode = joan_enc_force_joined ?
+			V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME : ctrl->val;
 		mutex_lock(&inst->lock);
 		if (inst->streamon_out && inst->streamon_cap) {
 			if (ctrl->val == V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE)
@@ -234,11 +276,13 @@ static int venc_op_s_ctrl(struct v4l2_ctrl *ctrl)
 		mutex_unlock(&inst->lock);
 		break;
 	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
+		/* 先算到局部变量，成功后再写回，避免失败时把 num_p_frames 清成 0 */
 		ret = venc_calc_bpframes(ctrl->val, ctr->num_b_frames, &bframes,
-					 &ctr->num_p_frames);
+					 &num_p);
 		if (ret)
 			return ret;
 
+		ctr->num_p_frames = num_p;
 		ctr->gop_size = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:

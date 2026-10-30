@@ -413,6 +413,9 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 {
 	struct qcom_smmu *qsmmu = to_qcom_smmu(smmu);
 	unsigned int last_s2cr;
+	unsigned int joan_valid = 0, joan_fw580 = 0, joan_fw586 = 0;
+	bool joan_mmss = smmu->ioaddr == 0xcd00000 &&
+		of_device_is_compatible(smmu->dev->of_node, "qcom,msm8998-smmu-v2");
 	u32 reg;
 	u32 smr;
 	int i;
@@ -475,10 +478,29 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 		}
 	}
 
+	if (joan_mmss)
+		dev_info(smmu->dev,
+			 "joan-smmu-smr: after-last-S2CR-test/before-first-device-reset begin groups=%u last_s2cr=%#x\n",
+			 smmu->num_mapping_groups, last_s2cr);
+
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
 		smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
 
 		if (FIELD_GET(ARM_SMMU_SMR_VALID, smr)) {
+			if (joan_mmss) {
+				u32 id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
+				u32 mask = FIELD_GET(ARM_SMMU_SMR_MASK,
+						     smr & ~ARM_SMMU_SMR_VALID);
+				bool fw580 = !((id ^ 0x580) & ~mask);
+				bool fw586 = !((id ^ 0x586) & ~mask);
+
+				joan_valid++;
+				joan_fw580 += fw580;
+				joan_fw586 += fw586;
+				dev_info(smmu->dev,
+					 "joan-smmu-smr: idx=%d raw=%#x id=%#x mask=%#x fw580=%d fw586=%d\n",
+					 i, smr, id, mask, fw580, fw586);
+			}
 			/* Ignore valid bit for SMR mask extraction. */
 			smr &= ~ARM_SMMU_SMR_VALID;
 			smmu->smrs[i].id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
@@ -490,6 +512,10 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 			smmu->s2crs[i].cbndx = 0xff;
 		}
 	}
+	if (joan_mmss)
+		dev_info(smmu->dev,
+			 "joan-smmu-smr: end groups=%u valid=%u fw580=%u fw586=%u\n",
+			 smmu->num_mapping_groups, joan_valid, joan_fw580, joan_fw586);
 
 	return 0;
 }

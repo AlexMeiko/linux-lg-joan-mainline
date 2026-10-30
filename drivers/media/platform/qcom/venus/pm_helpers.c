@@ -8,6 +8,7 @@
 #include <linux/interconnect.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
@@ -44,6 +45,8 @@ static int core_clks_enable(struct venus_core *core)
 	unsigned int freq_tbl_size = core->res->freq_tbl_size;
 	const struct venus_resources *res = core->res;
 	struct device *dev = core->dev;
+	bool msm8998_bootstrap = of_device_is_compatible(dev->of_node,
+						       "qcom,msm8998-venus");
 	unsigned long freq = 0;
 	struct dev_pm_opp *opp;
 	unsigned int i;
@@ -58,14 +61,29 @@ static int core_clks_enable(struct venus_core *core)
 		dev_pm_opp_put(opp);
 	}
 
+	/* 后续 runtime resume 保留会话协商出的更高频率。 */
+	if (msm8998_bootstrap)
+		freq = max(freq, clk_get_rate(core->clks[0]));
+
 	for (i = 0; i < res->clks_num; i++) {
-		if (IS_V6(core) || (IS_V4(core) && is_lite(core))) {
+		/* MSM8998 在 PAS 之前使用已选最低频率，不等首个 session。 */
+		if (msm8998_bootstrap && !i)
+			dev_info(dev, "joan-venus-trace: bootclk: before set core rate=%lu target=%lu\n",
+				 clk_get_rate(core->clks[i]), freq);
+		if (IS_V6(core) || (IS_V4(core) && is_lite(core)) ||
+		    (msm8998_bootstrap && !i)) {
 			ret = clk_set_rate(core->clks[i], freq);
+			if (msm8998_bootstrap && !i)
+				dev_info(dev, "joan-venus-trace: bootclk: set core ret=%d rate=%lu\n",
+					 ret, clk_get_rate(core->clks[i]));
 			if (ret)
 				goto err;
 		}
 
 		ret = clk_prepare_enable(core->clks[i]);
+		if (msm8998_bootstrap)
+			dev_info(dev, "joan-venus-trace: bootclk: enable %s ret=%d rate=%lu\n",
+				 res->clks[i], ret, clk_get_rate(core->clks[i]));
 		if (ret)
 			goto err;
 	}
@@ -222,6 +240,7 @@ static int load_scale_bw(struct venus_core *core)
 {
 	struct venus_inst *inst = NULL;
 	u32 mbs_per_sec, avg, peak, total_avg = 0, total_peak = 0;
+	int ret;
 
 	list_for_each_entry(inst, &core->instances, list) {
 		mbs_per_sec = load_per_instance(inst);
@@ -243,7 +262,18 @@ static int load_scale_bw(struct venus_core *core)
 	dev_dbg(core->dev, VDBGL "total: avg_bw: %u, peak_bw: %u\n",
 		total_avg, total_peak);
 
-	return icc_set_bw(core->video_path, total_avg, total_peak);
+	/* 带宽没变就不重复投票（本 DT 上 ICC 是空操作，1us，顺手省掉） */
+	if (total_avg == core->pm_cur_avg_bw &&
+	    total_peak == core->pm_cur_peak_bw)
+		return 0;
+
+	ret = icc_set_bw(core->video_path, total_avg, total_peak);
+	if (!ret) {
+		core->pm_cur_avg_bw = total_avg;
+		core->pm_cur_peak_bw = total_peak;
+	}
+
+	return ret;
 }
 
 static int load_scale_v1(struct venus_inst *inst)
@@ -278,7 +308,17 @@ static int load_scale_v1(struct venus_inst *inst)
 
 set_freq:
 
-	ret = core_clks_set_rate(core, freq);
+	/*
+	 * 只在频率真的变化时才重设。实测 load_scale 每帧被调用两次，
+	 * clk_set_rate 每次 44us，而 606 次调用里频率只变过 1 次 ——
+	 * 缓存后每帧省下约 88us。
+	 * 时钟在 core 下电时会被关掉，core_put_v1 里作废这个缓存。
+	 */
+	if (freq != core->pm_cur_freq) {
+		ret = core_clks_set_rate(core, freq);
+		if (!ret)
+			core->pm_cur_freq = freq;
+	}
 	if (ret) {
 		dev_err(dev, "failed to set clock rate %lu (%d)\n",
 			freq, ret);
@@ -294,6 +334,7 @@ set_freq:
 
 exit:
 	mutex_unlock(&core->lock);
+
 	return ret;
 }
 
@@ -314,6 +355,10 @@ static int core_get_v1(struct venus_core *core)
 
 static void core_put_v1(struct venus_core *core)
 {
+	/* 时钟已下电，缓存失效 */
+	core->pm_cur_freq = 0;
+	core->pm_cur_avg_bw = 0;
+	core->pm_cur_peak_bw = 0;
 }
 
 static int core_power_v1(struct venus_core *core, int on)

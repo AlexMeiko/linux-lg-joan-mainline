@@ -5,6 +5,16 @@
  */
 #include <linux/slab.h>
 #include <linux/mutex.h>
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
 #include <linux/list.h>
 #include <linux/completion.h>
 #include <linux/platform_device.h>
@@ -14,8 +24,105 @@
 #include "hfi.h"
 #include "hfi_cmds.h"
 #include "hfi_venus.h"
+#include "helpers.h"
 
 #define TIMEOUT		msecs_to_jiffies(1000)
+
+extern unsigned int joan_enc_prewarm;
+extern unsigned int joan_no_rpm;
+
+static int hfi_session_init_direct(struct venus_inst *inst, u32 pixfmt);
+
+static void joan_warm_event(struct venus_inst *inst, u32 event,
+			    struct hfi_event_data *data)
+{
+	inst->session_error = true;
+	joan_tlog("[warm] event=%u id=%#x error=%#x\n", event, inst->id,
+		  inst->error);
+}
+
+static const struct hfi_inst_ops joan_warm_ops = {
+	.event_notify = joan_warm_event,
+};
+
+/* Called with joan_warm_lock held and with the core powered. */
+static int joan_prewarm_encoder_locked(struct venus_core *core)
+{
+	struct venus_inst *warm, *other;
+	int ret;
+
+	if (core->joan_warm_enc)
+		return 0;
+	if (!joan_no_rpm || !IS_V3(core) || core->state != CORE_INIT)
+		return -EINVAL;
+
+	/* A replacement must also precede every live decoder session. */
+	mutex_lock(&core->lock);
+	list_for_each_entry(other, &core->instances, list) {
+		if (other->session_type == VIDC_SESSION_TYPE_DEC &&
+		    other->state != INST_UNINIT) {
+			mutex_unlock(&core->lock);
+			return -EBUSY;
+		}
+	}
+	mutex_unlock(&core->lock);
+
+	warm = kzalloc(sizeof(*warm), GFP_KERNEL);
+	if (!warm)
+		return -ENOMEM;
+	warm->core = core;
+	warm->session_type = VIDC_SESSION_TYPE_ENC;
+	warm->joan_owns_warm = true;
+	mutex_init(&warm->lock);
+	INIT_LIST_HEAD(&warm->list);
+
+	ret = hfi_session_create(warm, &joan_warm_ops);
+	if (ret)
+		goto free;
+	ret = hfi_session_init_direct(warm, V4L2_PIX_FMT_H264);
+	joan_tlog("[warm] create id=%#x state=%u core=%u ret=%d\n",
+		  warm->id, warm->state, core->state, ret);
+	if (ret) {
+		hfi_session_destroy(warm);
+		synchronize_irq(core->irq);
+		goto free;
+	}
+	core->joan_warm_enc = warm;
+	return 0;
+free:
+	mutex_destroy(&warm->lock);
+	kfree(warm);
+	return ret;
+}
+
+int hfi_joan_prewarm_encoder(struct venus_core *core)
+{
+	int ret;
+
+	if (!joan_enc_prewarm)
+		return 0;
+	mutex_lock(&core->joan_warm_lock);
+	ret = joan_prewarm_encoder_locked(core);
+	mutex_unlock(&core->joan_warm_lock);
+	return ret;
+}
+
+void hfi_joan_drop_warm_encoder(struct venus_core *core)
+{
+	struct venus_inst *warm;
+
+	mutex_lock(&core->joan_warm_lock);
+	warm = core->joan_warm_enc;
+	if (warm) {
+		core->joan_warm_enc = NULL;
+		hfi_session_deinit(warm);
+		hfi_session_destroy(warm);
+		synchronize_irq(core->irq);
+		mutex_destroy(&warm->lock);
+		kfree(warm);
+	}
+	mutex_unlock(&core->joan_warm_lock);
+}
 
 static u32 to_codec_type(u32 pixfmt)
 {
@@ -127,10 +234,35 @@ int hfi_core_suspend(struct venus_core *core)
 
 int hfi_core_resume(struct venus_core *core, bool force)
 {
+	int ret;
+
 	if (!force && core->state != CORE_INIT)
 		return 0;
 
-	return core->ops->resume(core);
+	ret = core->ops->resume(core);
+	if (ret)
+		return ret;
+
+	/*
+	 * 候选 49：resume 走 venus_power_on -> venus_run -> venus_boot_core，
+	 * 其中 PAS auth_and_reset 会把 ARM9 **重新启动**，固件侧 HFI 状态清零。
+	 * 原实现只做 power_on，不重发 HFI_CMD_SYS_INIT，于是空闲掉电再恢复后
+	 * 第一次会话必然失败（实测：连续编码 600 帧无错，空闲 60 秒后下一次必失败）。
+	 * 这里把状态标记为未初始化并重做 SYS_INIT 握手。
+	 */
+	core->state = CORE_UNINIT;
+	reinit_completion(&core->done);
+	ret = core->ops->core_init(core);
+	if (ret)
+		return ret;
+	ret = wait_for_completion_timeout(&core->done, TIMEOUT);
+	if (!ret)
+		return -ETIMEDOUT;
+	if (core->error != HFI_ERR_NONE)
+		return -EIO;
+	core->state = CORE_INIT;
+
+	return 0;
 }
 
 int hfi_core_trigger_ssr(struct venus_core *core, u32 type)
@@ -138,16 +270,25 @@ int hfi_core_trigger_ssr(struct venus_core *core, u32 type)
 	return core->ops->core_trigger_ssr(core, type);
 }
 
+atomic_t joan_sync_timeouts = ATOMIC_INIT(0);
+atomic_t joan_sync_errors = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(joan_sync_timeouts);
+EXPORT_SYMBOL_GPL(joan_sync_errors);
+
 static int wait_session_msg(struct venus_inst *inst)
 {
 	int ret;
 
 	ret = wait_for_completion_timeout(&inst->done, TIMEOUT);
-	if (!ret)
+	if (!ret) {
+		atomic_inc(&joan_sync_timeouts);
 		return -ETIMEDOUT;
+	}
 
-	if (inst->error != HFI_ERR_NONE)
+	if (inst->error != HFI_ERR_NONE) {
+		atomic_inc(&joan_sync_errors);
 		return -EIO;
+	}
 
 	return 0;
 }
@@ -188,7 +329,7 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(hfi_session_create);
 
-int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
+static int hfi_session_init_direct(struct venus_inst *inst, u32 pixfmt)
 {
 	struct venus_core *core = inst->core;
 	const struct hfi_ops *ops = core->ops;
@@ -209,20 +350,96 @@ int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
 	if (inst->state != INST_UNINIT)
 		return -EALREADY;
 
+	if (!inst->id) {
+		struct venus_inst *other;
+		u32 id;
+
+		/*
+		 * 原来用 hash32_ptr(inst)。实例是 kzalloc 出来的，关闭后
+		 * 同一 slab 槽位很容易被下一个实例复用，哈希值也就跟着重复；
+		 * 迟到的旧会话消息会被路由到新实例上。
+		 * 改成每 core 单调递增的编号，并跳过已被占用的值。
+		 */
+		mutex_lock(&core->lock);
+		do {
+			id = ++core->next_session_id;
+			if (!id)
+				id = ++core->next_session_id;
+			list_for_each_entry(other, &core->instances, list)
+				if (other->id == id)
+					break;
+		} while (!list_entry_is_head(other, &core->instances, list));
+		core->next_session_id = id;
+		inst->id = id;
+		mutex_unlock(&core->lock);
+	}
+
 	inst->hfi_codec = to_codec_type(pixfmt);
 	reinit_completion(&inst->done);
 
 	ret = ops->session_init(inst, inst->session_type, inst->hfi_codec);
+	JOAN_VTRACE("hfi_session_init: ops->session_init ret=%d type=%u codec=%u",
+		    ret, inst->session_type, inst->hfi_codec);
 	if (ret)
 		return ret;
 
 	ret = wait_session_msg(inst);
+	joan_tlog("[init] id=%#x type=%u codec=%#x ret=%d\n",
+		  inst->id, inst->session_type, pixfmt, ret);
+	JOAN_VTRACE("hfi_session_init: wait_session_msg ret=%d", ret);
 	if (ret)
 		return ret;
 
 	inst->state = INST_INIT;
 
 	return 0;
+}
+
+int hfi_session_init(struct venus_inst *inst, u32 pixfmt)
+{
+	struct venus_core *core = inst->core;
+	struct venus_inst *warm;
+	int ret;
+
+	if (!joan_enc_prewarm)
+		return hfi_session_init_direct(inst, pixfmt);
+	if (inst->state != INST_UNINIT)
+		return -EALREADY;
+
+	mutex_lock(&core->joan_warm_lock);
+	if (inst->session_type == VIDC_SESSION_TYPE_DEC) {
+		ret = joan_prewarm_encoder_locked(core);
+		if (ret) {
+			joan_tlog("[warm] replenish ret=%d\n", ret);
+			goto unlock;
+		}
+	}
+
+	warm = core->joan_warm_enc;
+	if (inst->session_type == VIDC_SESSION_TYPE_ENC &&
+	    pixfmt == V4L2_PIX_FMT_H264 && warm &&
+	    warm->state == INST_INIT && !warm->session_error) {
+		/* Change the reply lookup atomically; firmware retains the session. */
+		mutex_lock(&core->lock);
+		inst->id = warm->id;
+		inst->hfi_codec = warm->hfi_codec;
+		inst->state = INST_INIT;
+		core->joan_warm_enc = NULL;
+		list_del_init(&warm->list);
+		if (atomic_dec_and_test(&core->insts_count))
+			wake_up_var(&core->insts_count);
+		mutex_unlock(&core->lock);
+		synchronize_irq(core->irq);
+		mutex_destroy(&warm->lock);
+		kfree(warm);
+		joan_tlog("[warm] adopt id=%#x state=%u\n", inst->id, inst->state);
+		ret = 0;
+	} else {
+		ret = hfi_session_init_direct(inst, pixfmt);
+	}
+unlock:
+	mutex_unlock(&core->joan_warm_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(hfi_session_init);
 
@@ -506,10 +723,19 @@ int hfi_session_set_property(struct venus_inst *inst, u32 ptype, void *pdata)
 	if (test_bit(0, &inst->core->sys_error))
 		return -EIO;
 
-	if (inst->state < INST_INIT || inst->state >= INST_STOP)
+	if (inst->state < INST_INIT || inst->state >= INST_STOP) {
+		JOAN_VTRACE("hfi_set_property: ptype=%#x EINVAL state=%d",
+			    ptype, inst->state);
 		return -EINVAL;
+	}
 
-	return ops->session_set_property(inst, ptype, pdata);
+	{
+		int __ret = ops->session_set_property(inst, ptype, pdata);
+
+		JOAN_VTRACE("hfi_set_property: ptype=%#x ret=%d state=%d",
+			    ptype, __ret, inst->state);
+		return __ret;
+	}
 }
 EXPORT_SYMBOL_GPL(hfi_session_set_property);
 
@@ -520,11 +746,20 @@ int hfi_session_process_buf(struct venus_inst *inst, struct hfi_frame_data *fd)
 	if (test_bit(0, &inst->core->sys_error))
 		return -EIO;
 
-	if (fd->buffer_type == HFI_BUFFER_INPUT)
-		return ops->session_etb(inst, fd);
-	else if (fd->buffer_type == HFI_BUFFER_OUTPUT ||
-		 fd->buffer_type == HFI_BUFFER_OUTPUT2)
-		return ops->session_ftb(inst, fd);
+	{
+		int __ret;
+
+		if (fd->buffer_type == HFI_BUFFER_INPUT)
+			__ret = ops->session_etb(inst, fd);
+		else if (fd->buffer_type == HFI_BUFFER_OUTPUT ||
+			 fd->buffer_type == HFI_BUFFER_OUTPUT2)
+			__ret = ops->session_ftb(inst, fd);
+		else
+			return 0;
+		JOAN_VTRACE("process_buf: type=%u bytes=%u ret=%d",
+			    fd->buffer_type, fd->alloc_len, __ret);
+		return __ret;
+	}
 
 	return -EINVAL;
 }

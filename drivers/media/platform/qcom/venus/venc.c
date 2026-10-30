@@ -5,6 +5,42 @@
  */
 #include <linux/clk.h>
 #include <linux/module.h>
+#include <linux/delay.h>
+
+/* 候选 46：编码器高度是否按 32 对齐（默认 0=只对齐到 2）*/
+
+
+static bool joan_enc_nv12_repack = 1;
+
+unsigned int joan_enc_repush_props;
+
+unsigned int joan_enc_start_delay_ms;
+
+unsigned int joan_enc_h_align32;
+
+unsigned int joan_enc_resubmit_inputs = 1;
+
+extern unsigned int joan_enc_cap_before_input;
+extern unsigned int joan_enc_reload_res;
+extern unsigned int joan_enc_recover;
+
+unsigned int joan_enc_release_input = 1;
+
+unsigned int joan_enc_hold_caps = 1;
+
+unsigned int joan_enc_autostart_cap = 1;
+
+unsigned int joan_stat_start, joan_stat_autostart, joan_stat_hold, joan_stat_capsub;
+
+#ifndef JOAN_VTRACE
+/*
+ * 调试跟踪默认写进内存环形缓冲（joan_tlog），不走控制台。
+ * 原来这里用 pr_info，而 hfi_msgs.c 对**每一条** HFI 消息都会调一次 ——
+ * 一次短压力测试就产生上千行内核日志，既是日志刷屏也是实打实的 CPU 开销。
+ * 需要看时读 /sys/module/venus_core/parameters/joan_trace_ring。
+ */
+#define JOAN_VTRACE(fmt, ...) joan_tlog(fmt "\n", ##__VA_ARGS__)
+#endif
 #include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -197,8 +233,26 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 	pixmp->height = clamp(pixmp->height, frame_height_min(inst),
 			      frame_height_max(inst));
 
-	pixmp->width = ALIGN(pixmp->width, 128);
-	pixmp->height = ALIGN(pixmp->height, 32);
+	/* 候选 153：可选跳过 128 对齐（320 会被扩成 384，导致 app 按 384 步幅
+	 * 填 138240 字节，而固件期望的可见尺寸是 115200） */
+	/*
+	 * 只做偶数对齐，**不**把可见宽度扩到 128 的倍数。
+	 * 扩宽会让 320 宽的输入输出成 384 宽（多出 64 列填充），
+	 * 用户拿到的码流尺寸就变了。硬件要求的 128 步幅由
+	 * venc_buf_prepare() 在 QBUF 时重排完成，sizeimage 也仍按
+	 * ALIGN(width,128) 计算，缓冲足够。
+	 */
+	pixmp->width = ALIGN(pixmp->width, 2);
+	/*
+	 * 候选 46：原来高度按 32 对齐（240→256）。ffmpeg 的 v4l2m2m 在把 AVFrame
+	 * 拷进 V4L2 缓冲时用 **V4L2 的 height** 计算行数，帧只有 240 行时会越界读，
+	 * 表现为段错误（实测 v4l2_bufref_to_buf 里只拷 112 字节即崩）。
+	 * 宽度对齐是 stride 的硬件要求（保持不变），高度只保留 2 对齐。
+	 */
+	if (joan_enc_h_align32)
+		pixmp->height = ALIGN(pixmp->height, 32);
+	else
+		pixmp->height = ALIGN(pixmp->height, 2);
 
 	pixmp->width = ALIGN(pixmp->width, 2);
 	pixmp->height = ALIGN(pixmp->height, 2);
@@ -221,6 +275,7 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
 	return fmt;
 }
 
+static int venc_s_fmt_traced(struct file *file, void *fh, struct v4l2_format *f);
 static int venc_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct venus_inst *inst = to_inst(file);
@@ -249,6 +304,15 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	orig_pixmp = *pixmp;
 
+	/*
+	 * 4:2:0 需要偶数宽高，过小尺寸固件无法构成合法帧。
+	 * 必须在 clamp/对齐之前用调用方原始值判断，否则 1920x1 这类
+	 * 会被 clamp 到最小高度后放行，最终产出垃圾码流。
+	 */
+	if ((orig_pixmp.width & 1) || (orig_pixmp.height & 1) ||
+	    orig_pixmp.width < 16 || orig_pixmp.height < 16)
+		return -EINVAL;
+
 	fmt = venc_try_fmt_common(inst, f);
 	if (!fmt)
 		return -EINVAL;
@@ -272,6 +336,18 @@ static int venc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		inst->out_width = format.fmt.pix_mp.width;
 		inst->out_height = format.fmt.pix_mp.height;
+		/*
+		 * 记录「可见尺寸」，用于把固件的 filled_len 截到真实帧大小。
+		 *
+		 * 两点必须注意：
+		 * 1) 不能用对齐后的 out_width —— 我们已不再把可见宽度扩到 128 倍数，
+		 *    format 里的宽高就是可见值（已被 try_fmt_common 夹到 16..4096）。
+		 * 2) 不能只在第一次 S_FMT 记录 —— 同一个 fd 从 320x240 改到 1080p 时
+		 *    旧值会把 filled_len 截成 115200，固件只能拿到小半帧。
+		 * 用 clamp 后的值同时避免了用 orig_pixmp 原值做 u32 乘法溢出。
+		 */
+		inst->joan_vis_w = format.fmt.pix_mp.width;
+		inst->joan_vis_h = format.fmt.pix_mp.height;
 		inst->colorspace = pixmp->colorspace;
 		inst->ycbcr_enc = pixmp->ycbcr_enc;
 		inst->quantization = pixmp->quantization;
@@ -547,9 +623,36 @@ venc_encoder_cmd(struct file *file, void *fh, struct v4l2_encoder_cmd *cmd)
 
 		fdata.buffer_type = HFI_BUFFER_INPUT;
 		fdata.flags |= HFI_BUFFERFLAG_EOS;
-		fdata.device_addr = 0xdeadb000;
+		/*
+		 * 候选 42：msm8998（HFI 3XX，venus-4.4 固件）会用
+		 * HFI_ERR_SESSION_INVALID_PARAMETER(0x1001) 拒绝
+		 * device_addr=0xdeadb000 的 EOS 空缓冲（实测 data2=0xdeadb000）。
+		 * V3 上改用 0 地址。
+		 */
+		/*
+		 * 候选 43：msm8998 固件拒绝 0xdeadb000（会话错误 0x1001，
+		 * data2=0xdeadb000），而 0 地址又被 pkt_session_etb 拒绝。
+		 * 下游的做法是用**真实缓冲地址**发 EOS 空缓冲，这里复用最近
+		 * 一次输入缓冲的地址。
+		 */
+		fdata.device_addr = inst->joan_last_in_addr;
+		/*
+		 * 候选 44：固件对 alloc_len=0 的 EOS ETB 回
+		 * HFI_ERR_SESSION_INVALID_PARAMETER(0x1001)，这里带上真实缓冲大小。
+		 */
+		fdata.alloc_len = inst->input_buf_size;
+		/*
+		 * 候选 48：clnt_data 原来是自造的 0xffff。固件按 clnt_data 跟踪缓冲，
+		 * 自造值可能让它的缓冲表每会话泄漏一项（实测跑 4 个会话后固件开始报错）。
+		 * 改用 0（与 downstream 对 EOS 缓冲的处理一致）。
+		 */
+		fdata.clnt_data = 0;
+		JOAN_VTRACE("venc_enc_cmd: EOS addr=%#x alloc=%u",
+			    (u32)fdata.device_addr, fdata.alloc_len);
 
+		JOAN_VTRACE("venc_enc_cmd: STOP -> send EOS empty buffer");
 		ret = hfi_session_process_buf(inst, &fdata);
+		JOAN_VTRACE("venc_enc_cmd: EOS buffer ret=%d", ret);
 
 		inst->enc_state = VENUS_ENC_STATE_DRAIN;
 	} else if (cmd->cmd == V4L2_ENC_CMD_START) {
@@ -568,6 +671,64 @@ unlock:
 	return ret;
 }
 
+/*
+ * 原始输入队列固定使用 non-coherent（缓存）分配。
+ *
+ * 直接在 queue_setup 里写 q->non_coherent_mem 会和 vb2 的
+ * verify_coherency_flags() 冲突：CREATE_BUFS 时它拿应用传入的 flags
+ * （不含 NON_COHERENT）和 q->non_coherent_mem 比较，不一致就 -EINVAL。
+ * 正确做法是让应用"看起来"请求了这个模式 —— 在 ioctl 入口补上标志，
+ * 并给队列打开 allow_cache_hints，两处保持一致。
+ */
+static void venc_force_non_coherent(struct v4l2_requestbuffers *rb)
+{
+	if (rb->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
+	    rb->memory == V4L2_MEMORY_MMAP)
+		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+}
+
+static int venc_ioctl_reqbufs(struct file *file, void *priv,
+			      struct v4l2_requestbuffers *rb)
+{
+	venc_force_non_coherent(rb);
+	return v4l2_m2m_ioctl_reqbufs(file, priv, rb);
+}
+
+static int venc_ioctl_create_bufs(struct file *file, void *priv,
+				  struct v4l2_create_buffers *cb)
+{
+	if (cb->format.type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
+	    cb->memory == V4L2_MEMORY_MMAP)
+		cb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+
+	return v4l2_m2m_ioctl_create_bufs(file, priv, cb);
+}
+
+/*
+ * 队列开了 allow_cache_hints 之后，应用可以传 NO_CACHE_CLEAN /
+ * NO_CACHE_INVALIDATE 让 vb2 跳过同步。但驱动在 buf_prepare 里要写缓冲
+ * （NV12 重排），跳过同步会读到旧数据 / 写回不刷新。
+ * 这两个队列不支持这种跳过，统一清掉。
+ */
+static void venc_force_cache_sync(struct v4l2_buffer *b)
+{
+	b->flags &= ~(V4L2_BUF_FLAG_NO_CACHE_INVALIDATE |
+		      V4L2_BUF_FLAG_NO_CACHE_CLEAN);
+}
+
+static int venc_ioctl_prepare_buf(struct file *file, void *priv,
+				  struct v4l2_buffer *b)
+{
+	venc_force_cache_sync(b);
+	return v4l2_m2m_ioctl_prepare_buf(file, priv, b);
+}
+
+static int venc_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *b)
+{
+	venc_force_cache_sync(b);
+	return v4l2_m2m_ioctl_qbuf(file, priv, b);
+}
+
 static const struct v4l2_ioctl_ops venc_ioctl_ops = {
 	.vidioc_querycap = venc_querycap,
 	.vidioc_enum_fmt_vid_cap = venc_enum_fmt,
@@ -580,11 +741,11 @@ static const struct v4l2_ioctl_ops venc_ioctl_ops = {
 	.vidioc_try_fmt_vid_out_mplane = venc_try_fmt,
 	.vidioc_g_selection = venc_g_selection,
 	.vidioc_s_selection = venc_s_selection,
-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_reqbufs = venc_ioctl_reqbufs,
 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
-	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
-	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
-	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+	.vidioc_create_bufs = venc_ioctl_create_bufs,
+	.vidioc_prepare_buf = venc_ioctl_prepare_buf,
+	.vidioc_qbuf = venc_ioctl_qbuf,
 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
@@ -729,6 +890,16 @@ static int venc_set_properties(struct venus_inst *inst)
 			h264_transform.enable_type = ctr->h264_8x8_transform;
 
 		ret = hfi_session_set_property(inst, ptype, &h264_transform);
+		if (ret == -EINVAL) {
+			/*
+			 * msm8998 的 venus-4.4 固件对这个属性返回 EINVAL
+			 * （enable_type=0 也拒）；8x8 transform 只是编码可选项，
+			 * 记录后继续，避免整个会话初始化失败。
+			 */
+			JOAN_VTRACE("venc: H264_TRANSFORM_8X8 rejected (enable=%u), ignored",
+				    h264_transform.enable_type);
+			ret = 0;
+		}
 		if (ret)
 			return ret;
 
@@ -1035,25 +1206,34 @@ static int venc_init_session(struct venus_inst *inst)
 
 	ret = venus_helper_set_stride(inst, inst->out_width,
 				      inst->out_height);
+	JOAN_VTRACE("venc_init_session: set_stride(%u,%u) ret=%d",
+		    inst->out_width, inst->out_height, ret);
 	if (ret)
 		goto deinit;
 
 	ret = venus_helper_set_input_resolution(inst, inst->width,
 						inst->height);
+	JOAN_VTRACE("venc_init_session: set_input_resolution(%u,%u) ret=%d",
+		    inst->width, inst->height, ret);
 	if (ret)
 		goto deinit;
 
 	ret = venus_helper_set_output_resolution(inst, inst->width,
 						 inst->height,
 						 HFI_BUFFER_OUTPUT);
+	JOAN_VTRACE("venc_init_session: set_output_resolution(%u,%u) ret=%d",
+		    inst->width, inst->height, ret);
 	if (ret)
 		goto deinit;
 
 	ret = venus_helper_set_color_format(inst, inst->fmt_out->pixfmt);
+	JOAN_VTRACE("venc_init_session: set_color_format(%#x) ret=%d",
+		    inst->fmt_out->pixfmt, ret);
 	if (ret)
 		goto deinit;
 
 	ret = venc_set_properties(inst);
+	JOAN_VTRACE("venc_init_session: venc_set_properties ret=%d", ret);
 	if (ret)
 		goto deinit;
 
@@ -1086,22 +1266,36 @@ static int venc_queue_setup(struct vb2_queue *q,
 	unsigned int num, min = 4;
 	int ret;
 
+	JOAN_VTRACE("venc_queue_setup: type=%d num_planes=%u num_buffers=%u",
+		    q->type, *num_planes, *num_buffers);
 	if (*num_planes) {
 		if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
-		    *num_planes != inst->fmt_out->num_planes)
+		    *num_planes != inst->fmt_out->num_planes) {
+			JOAN_VTRACE("venc_queue_setup: EINVAL planes out %u != %u",
+				    *num_planes, inst->fmt_out->num_planes);
 			return -EINVAL;
+		}
 
 		if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
-		    *num_planes != inst->fmt_cap->num_planes)
+		    *num_planes != inst->fmt_cap->num_planes) {
+			JOAN_VTRACE("venc_queue_setup: EINVAL planes cap %u != %u",
+				    *num_planes, inst->fmt_cap->num_planes);
 			return -EINVAL;
+		}
 
 		if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
-		    sizes[0] < inst->input_buf_size)
+		    sizes[0] < inst->input_buf_size) {
+			JOAN_VTRACE("venc_queue_setup: EINVAL size out %u < %u",
+				    sizes[0], inst->input_buf_size);
 			return -EINVAL;
+		}
 
 		if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
-		    sizes[0] < inst->output_buf_size)
+		    sizes[0] < inst->output_buf_size) {
+			JOAN_VTRACE("venc_queue_setup: EINVAL size cap %u < %u",
+				    sizes[0], inst->output_buf_size);
 			return -EINVAL;
+		}
 
 		return 0;
 	}
@@ -1122,6 +1316,7 @@ static int venc_queue_setup(struct vb2_queue *q,
 
 	mutex_lock(&inst->lock);
 	ret = venc_init_session(inst);
+	JOAN_VTRACE("venc_queue_setup: venc_init_session ret=%d", ret);
 	mutex_unlock(&inst->lock);
 
 	if (ret)
@@ -1206,9 +1401,20 @@ static void venc_buf_cleanup(struct vb2_buffer *vb)
 	struct venus_buffer *buf = to_venus_buffer(vbuf);
 
 	mutex_lock(&inst->lock);
-	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		if (!list_empty(&inst->registeredbufs))
 			list_del_init(&buf->reg_list);
+		/*
+		 * 缓冲要被销毁了，必须先从"持有"链表摘掉。
+		 * 否则启动失败/REQBUFS(0) 之后链表里会留下指向已释放缓冲的节点，
+		 * 后续遍历就是 use-after-free；残留的 joan_held 还会让重新
+		 * 入队的缓冲被跳过（永远不提交给固件）。
+		 */
+		if (buf->joan_held) {
+			list_del_init(&buf->joan_list);
+			buf->joan_held = false;
+		}
+	}
 	mutex_unlock(&inst->lock);
 
 	inst->buf_count--;
@@ -1244,11 +1450,14 @@ static int venc_verify_conf(struct venus_inst *inst)
 	return 0;
 }
 
+static int venc_submit_pending_caps(struct venus_inst *inst);
+
 static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct venus_inst *inst = vb2_get_drv_priv(q);
 	int ret;
 
+	JOAN_VTRACE("venc_start_streaming: type=%d count=%u", q->type, count);
 	mutex_lock(&inst->lock);
 
 	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
@@ -1256,9 +1465,53 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	else
 		inst->streamon_cap = 1;
 
+	joan_stat_start++;
+	joan_tlog("[st] type=%d count=%u running=%d\n", q->type, count,
+		  inst->joan_enc_running);
 	if (!(inst->streamon_out & inst->streamon_cap)) {
+		/*
+		 * 候选 119：ffmpeg 的 v4l2m2m 编码器会先把捕获缓冲 QBUF 进来，
+		 * 又要等捕获缓冲被完成才去 STREAMON(capture)，形成鸡生蛋。
+		 * 输出队列一启动就把整个会话跑起来。
+		 */
+		if (joan_enc_autostart_cap && inst->streamon_out &&
+		    !inst->streamon_cap) {
+			joan_stat_autostart++;
+			inst->streamon_cap = 1;
+		} else {
+			mutex_unlock(&inst->lock);
+			return 0;
+		}
+	}
+
+	if (inst->joan_enc_running) {
+		/*
+		 * 候选 136：会话已由输出队列自动启动。这里只补提交「还没提交过」的
+		 * 捕获缓冲——转码时 ffmpeg 是在 STREAMON(out) 之后才排捕获缓冲的，
+		 * 自动启动那次队列还是空的。用每缓冲 joan_submitted 标记精确判断，
+		 * 避免同一缓冲重复进固件（重复会被固件判 0x1002）。
+		 */
+		if (joan_enc_cap_before_input &&
+		    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+			int n_cap = venc_submit_pending_caps(inst);
+
+			joan_tlog("[r] 提交捕获 n=%d\n", n_cap);
+			if (n_cap)
+				inst->joan_cap_ready = true;
+			if (inst->joan_cap_ready && joan_enc_release_input) {
+				int r2 = venus_helper_process_initial_out_bufs(inst);
+
+				joan_tlog("[cap-ok] 补提交输入 ret=%d\n", r2);
+			}
+		}
 		mutex_unlock(&inst->lock);
 		return 0;
+	}
+
+	if (joan_enc_start_delay_ms) {
+		joan_tlog("[delay] 编码会话启动延迟 %u ms\n",
+			  joan_enc_start_delay_ms);
+		msleep(joan_enc_start_delay_ms);
 	}
 
 	venus_helper_init_instance(inst);
@@ -1279,6 +1532,8 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto error;
 
 	ret = venc_set_properties(inst);
+	joan_tlog("[props] ret=%d %ux%u vis=%ux%u\n", ret, inst->width,
+		  inst->height, inst->joan_vis_w, inst->joan_vis_h);
 	if (ret)
 		goto error;
 
@@ -1295,7 +1550,30 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto error;
 
+	if (joan_enc_repush_props) {
+		int r3 = venc_set_properties(inst);
+
+		joan_tlog("[reprops] ret=%d\n", r3);
+	}
+
+	/* 候选 139：捕获缓冲没就绪前不要提交输入帧 */
+	if (joan_enc_resubmit_inputs && inst->joan_cap_ready) {
+		int r9 = venus_helper_process_initial_out_bufs(inst);
+
+		joan_tlog("[in-ok] 启动时补提交输入 ret=%d\n", r9);
+	}
+
+	{
+		int n_cap = venc_submit_pending_caps(inst);
+
+		joan_tlog("[s] 提交捕获 n=%d\n", n_cap);
+		if (n_cap)
+			inst->joan_cap_ready = true;
+		JOAN_VTRACE("venc_start_streaming: 提交暂缓捕获 n=%d", n_cap);
+	}
+
 	inst->enc_state = VENUS_ENC_STATE_ENCODING;
+	inst->joan_enc_running = true;
 
 	mutex_unlock(&inst->lock);
 
@@ -1313,14 +1591,130 @@ error:
 	return ret;
 }
 
+static void joan_rec_work_fn(struct work_struct *work)
+{
+	struct venus_inst *inst = container_of(work, struct venus_inst,
+					      joan_rec_work);
+	int r;
+
+	mutex_lock(&inst->lock);
+	joan_tlog("[rec] 开始重建编码会话\n");
+
+	/* 完整重建：abort -> deinit -> init -> 属性 -> 启动 */
+	hfi_session_abort(inst);
+	hfi_session_deinit(inst);
+	joan_tlog("[rec] deinit 完成\n");
+	usleep_range(3000, 4000);
+
+	venus_helper_init_instance(inst);
+	joan_tlog("[rec] init 完成\n");
+	r = venc_set_properties(inst);
+	joan_tlog("[rec] props=%d\n", r);
+	if (!r) {
+		r = venus_helper_set_num_bufs(inst, inst->num_input_bufs,
+					      inst->num_output_bufs, 0);
+		joan_tlog("[rec] numbufs=%d\n", r);
+	}
+	if (!r) {
+		r = venus_helper_vb2_start_streaming(inst);
+		joan_tlog("[rec] start=%d\n", r);
+	}
+	if (!r) {
+		struct venus_buffer *vbuf, *tmp;
+
+		inst->joan_enc_running = true;
+		list_for_each_entry_safe(vbuf, tmp, &inst->joan_held_caps,
+					 joan_list) {
+			list_del_init(&vbuf->joan_list);
+			vbuf->joan_held = false;
+			venus_helper_process_one_buf(inst, &vbuf->vb);
+		}
+		venus_helper_process_initial_out_bufs(inst);
+		joan_tlog("[rec] 重建后重提交完成\n");
+	}
+	mutex_unlock(&inst->lock);
+}
+
+static void joan_in_work_fn(struct work_struct *work)
+{
+	struct venus_inst *inst = container_of(to_delayed_work(work),
+					      struct venus_inst, joan_in_work);
+	int r;
+
+	mutex_lock(&inst->lock);
+	r = venus_helper_process_initial_out_bufs(inst);
+	joan_tlog("[in-work] 补提交输入 ret=%d\n", r);
+	mutex_unlock(&inst->lock);
+}
+
+static int venc_submit_pending_caps(struct venus_inst *inst)
+{
+	struct venus_buffer *vbuf, *tmp;
+	int n_sub = 0;
+
+	list_for_each_entry_safe(vbuf, tmp, &inst->joan_held_caps, joan_list) {
+		list_del_init(&vbuf->joan_list);
+		vbuf->joan_held = false;
+		venus_helper_process_one_buf(inst, &vbuf->vb);
+		joan_stat_capsub++;
+		n_sub++;
+	}
+
+	return n_sub;
+}
+
 static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 {
+	JOAN_VTRACE("venc_buf_queue: type=%d index=%u", vb->type, vb->index);
 	struct venus_inst *inst = vb2_get_drv_priv(vb->vb2_queue);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 
 	venc_pm_get_put(inst);
 
 	mutex_lock(&inst->lock);
+
+	/*
+	 * 候选 116：vb2_start_streaming() 会在调用驱动的 start_streaming 之前就把
+	 * 预排队缓冲丢进 buf_queue()，此时 start_streaming_called 仍为 0、enc_state
+	 * 还是 STOPPED。转码时 ffmpeg 正是这样排捕获缓冲的，若当 drain 直接归还，
+	 * 固件永远没有输出缓冲，之后每一帧输入都被判 0x1002。
+	 */
+	joan_tlog("[q] t=%d i=%u ssc=%d held=%d run=%d pay=%u fl=%#x mem=%d len=%u\n",
+		  vb->type, vb->index, vb2_start_streaming_called(vb->vb2_queue),
+		  to_venus_buffer(vbuf)->joan_held, inst->joan_enc_running,
+		  vb2_get_plane_payload(vb, 0), vbuf->flags,
+		  vb->memory, vb->planes[0].length);
+
+	if (joan_enc_hold_caps && V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
+	    !vb2_start_streaming_called(vb->vb2_queue)) {
+		struct venus_buffer *hb = to_venus_buffer(vbuf);
+
+		/*
+		 * 候选 126：照抄解码器已验证的做法——先把缓冲挂进 v4l2-m2m 队列，
+		 * 由 venus_helper_vb2_buf_queue() 因"两个队列都还没 STREAMON"而暂缓
+		 * 提交；等 start_streaming 真正启动会话后再用
+		 * venus_helper_process_initial_cap_bufs() 一次性提交。
+		 *
+		 * 同一缓冲会被 buf_queue 两次（app QBUF 一次、vb2 STREAMON 时再
+		 * enqueue 一次），用 joan_held 保证只挂一次，否则 m2m 链表损坏。
+		 */
+		if (!hb->joan_held) {
+			hb->joan_held = true;
+			joan_stat_hold++;
+			list_add_tail(&hb->joan_list, &inst->joan_held_caps);
+
+			/*
+			 * 候选 147：这里只能"持有"，绝不能再调
+			 * venus_helper_vb2_buf_queue() —— 自动启动后两个队列都已置位，
+			 * 那个 helper 会立刻把缓冲提交给固件，随后 start_streaming
+			 * 里的计数提交又会提交一次，重复提交直接把固件打崩。
+			 */
+			venus_helper_vb2_buf_queue(vb);
+			JOAN_VTRACE("venc_buf_queue: 持有捕获 idx=%u", vb->index);
+		}
+		mutex_unlock(&inst->lock);
+		return;
+	}
 
 	if (inst->enc_state == VENUS_ENC_STATE_STOPPED) {
 		vbuf->sequence = inst->sequence_cap++;
@@ -1335,11 +1729,124 @@ static void venc_vb2_buf_queue(struct vb2_buffer *vb)
 	mutex_unlock(&inst->lock);
 }
 
+static int venc_buf_prepare(struct vb2_buffer *vb)
+{
+	struct venus_inst *inst = vb2_get_drv_priv(vb->vb2_queue);
+	u32 src_stride, dst_stride, y_rows, uv_rows;
+	u32 src_uv, dst_uv, dst_y_size;
+	u32 payload, bufsize;
+	void *data;
+	int ret, r;
+
+	ret = venus_helper_vb2_buf_prepare(vb);
+	if (ret || !joan_enc_nv12_repack ||
+	    vb->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ||
+	    inst->fmt_out->pixfmt != V4L2_PIX_FMT_NV12)
+		return ret;
+
+	payload = vb2_get_plane_payload(vb, 0);
+	bufsize = vb2_plane_size(vb, 0);
+	if (!payload || vb->memory != VB2_MEMORY_MMAP || vb->planes[0].data_offset)
+		return 0;
+
+	/*
+	 * 用户态（ffmpeg v4l2m2m）按**可见尺寸的紧凑布局**填数据：
+	 *   Y: width x height，UV 紧跟其后，载荷 = width*height*3/2。
+	 * 而 Venus 硬件按 128 对齐步幅、32 行对齐高度取图：
+	 *   Y: ALIGN(width,128) x ALIGN(height,32)，UV 起点在 Y 平面之后。
+	 * 两者在 320x240 这类尺寸上差 64 字节/行、16 行，直接喂进去画面会
+	 * 从中间开始错位（实测上 1/3 彩条乱码、下 2/3 纯绿）。
+	 * 这里在 QBUF 之前把紧凑布局重排成硬件布局。
+	 */
+	y_rows = inst->out_height;
+	uv_rows = DIV_ROUND_UP(inst->out_height, 2);
+	/*
+	 * 源步幅不能直接用 inst->out_width —— 那是 S_FMT 之后的对齐值（384）。
+	 * 用户态实际是按**可见宽度**紧凑填充的，所以从载荷反推：
+	 *   payload = src_stride * (y_rows + uv_rows)
+	 */
+	if (!(y_rows + uv_rows))
+		return 0;
+	src_stride = payload / (y_rows + uv_rows);
+	if (src_stride * (y_rows + uv_rows) != payload)
+		return 0;
+	dst_stride = ALIGN(inst->out_width, 128);
+	/* 宽度已经 128 对齐时 src==dst，但 UV 平面仍需按行数对齐搬迁，
+	 * 不能在这里直接返回（否则 720p/1080p 的色度会错位成重影）。 */
+	if (dst_stride < src_stride)
+		return 0;
+	src_uv = src_stride * y_rows;
+	dst_y_size = dst_stride * ALIGN(y_rows, 32);
+	dst_uv = dst_y_size;
+
+	/* 已经是硬件布局（载荷覆盖到 UV 末尾）就不动 */
+	if (payload >= dst_uv + dst_stride * ALIGN(uv_rows, 16))
+		return 0;
+	/*
+	 * 只认两种布局：已经是硬件布局（上面已跳过），或者用户态紧凑布局。
+	 * 其它情况说明用户态写的尺寸和我们理解的不一致，继续下去只会
+	 * 产出花屏 —— 直接报错比静默输出坏画面好。
+	 */
+	if (payload < src_uv + src_stride * uv_rows) {
+		dev_warn(inst->core->dev, "joan: 无法识别的 NV12 载荷 %u（期望 %u）\n",
+			 payload, src_uv + src_stride * uv_rows);
+		return -EINVAL;
+	}
+	if (dst_uv + dst_stride * ALIGN(uv_rows, 16) > bufsize)
+		return 0;
+
+	data = vb2_plane_vaddr(vb, 0);
+	if (!data)
+		return -EFAULT;
+
+
+	/*
+	 * 顺序很关键：必须先搬 UV，再搬 Y。
+	 * Y 的目标区间（0 .. dst_uv）会覆盖 UV 的源区间（src_uv ..），
+	 * 先搬 Y 会把还没搬走的 UV 数据踩掉 —— 实测表现为整幅横向彩条。
+	 * 两次都从后往前，避免同一平面内自我覆盖。
+	 */
+	if (src_uv != dst_uv || src_stride != dst_stride) {
+		if (src_stride == dst_stride)
+			/* 步幅相同（128 对齐宽度）时整块搬，省掉每行的调用开销 */
+			memmove(data + dst_uv, data + src_uv,
+				(u32)uv_rows * dst_stride);
+		else
+			for (r = (int)uv_rows - 1; r >= 0; r--)
+				memmove(data + dst_uv + (u32)r * dst_stride,
+					data + src_uv + (u32)r * src_stride,
+					src_stride);
+	}
+	if (src_stride != dst_stride) {
+		for (r = (int)y_rows - 1; r >= 0; r--)
+			memmove(data + (u32)r * dst_stride,
+				data + (u32)r * src_stride, src_stride);
+	}
+	/* Y 尾部空洞与 UV 末行补齐填中性色度 */
+	if (dst_y_size > dst_stride * y_rows)
+		memset(data + dst_stride * y_rows, 16,
+		       dst_y_size - dst_stride * y_rows);
+	if (dst_stride * ALIGN(uv_rows, 16) > dst_stride * uv_rows)
+		memset(data + dst_uv + dst_stride * uv_rows, 16,
+		       dst_stride * (ALIGN(uv_rows, 16) - uv_rows));
+	dma_wmb();
+
+	/*
+	 * 重排是原地改内容、不幂等：用户态 DQBUF 后不重写内容就再次 QBUF 时，
+	 * 会把已转换好的数据再搬一次（4K 实测 414 万个字节被破坏）。
+	 * 把 payload 改成硬件布局的完整大小，再次 QBUF 就会命中上面
+	 * "已经是硬件布局"的判断直接跳过；用户态若重新写入紧凑帧并恢复
+	 * payload，仍会正常重排。
+	 */
+	vb2_set_plane_payload(vb, 0, dst_uv + dst_stride * ALIGN(uv_rows, 16));
+	return 0;
+}
+
 static const struct vb2_ops venc_vb2_ops = {
 	.queue_setup = venc_queue_setup,
 	.buf_init = venc_buf_init,
 	.buf_cleanup = venc_buf_cleanup,
-	.buf_prepare = venus_helper_vb2_buf_prepare,
+	.buf_prepare = venc_buf_prepare,
 	.start_streaming = venc_start_streaming,
 	.stop_streaming = venus_helper_vb2_stop_streaming,
 	.buf_queue = venc_vb2_buf_queue,
@@ -1364,6 +1871,14 @@ static void venc_buf_done(struct venus_inst *inst, unsigned int buf_type,
 	if (!vbuf)
 		return;
 
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		to_venus_buffer(vbuf)->joan_submitted = false;
+		joan_tlog("[done] cap tag=%u bytes=%u\n", tag, bytesused);
+	}
+
+	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		to_venus_buffer(vbuf)->joan_submitted = false;
+
 	vbuf->flags = flags;
 
 	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -1372,8 +1887,11 @@ static void venc_buf_done(struct venus_inst *inst, unsigned int buf_type,
 		vb->planes[0].data_offset = data_offset;
 		vb->timestamp = timestamp_us * NSEC_PER_USEC;
 		vbuf->sequence = inst->sequence_cap++;
+		JOAN_VTRACE("venc_buf_done: cap tag=%u bytes=%u flags=%#x hfi_flags=%#x state=%d",
+			    tag, bytesused, flags, hfi_flags, inst->enc_state);
 		if ((vbuf->flags & V4L2_BUF_FLAG_LAST) &&
 		    inst->enc_state == VENUS_ENC_STATE_DRAIN) {
+			JOAN_VTRACE("venc_buf_done: LAST seen -> STOPPED");
 			inst->enc_state = VENUS_ENC_STATE_STOPPED;
 		}
 	} else {
@@ -1420,6 +1938,15 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
 	src_vq->mem_ops = &vb2_dma_contig_memops;
 	src_vq->drv_priv = inst;
 	src_vq->buf_struct_size = sizeof(struct venus_buffer);
+	/*
+	 * 只让原始（未压缩）输入队列接受 cache hints。
+	 * 编码器要在 venc_buf_prepare() 里把紧凑 NV12 重排成固件布局，
+	 * 非缓存内存下这一步 4K 每帧要 10.5ms；走 non-coherent 分配
+	 * （缓存映射 + vb2 自动 dma_sync）能降到 0.52ms。
+	 * 压缩码流的 CAPTURE 队列没有 CPU 拷贝，保持默认分配，
+	 * 这样它的 CREATE_BUFS 仍然可用。
+	 */
+	src_vq->allow_cache_hints = 1;
 	src_vq->allow_zero_bytesused = 1;
 	src_vq->min_queued_buffers = 1;
 	src_vq->dev = inst->core->dev;
@@ -1464,6 +1991,7 @@ static int venc_open(struct file *file)
 	struct venus_inst *inst;
 	int ret;
 
+	JOAN_VTRACE("venc_open: enter nonblock=%d", file->f_flags & O_NONBLOCK);
 	inst = kzalloc(sizeof(*inst), GFP_KERNEL);
 	if (!inst)
 		return -ENOMEM;
@@ -1472,6 +2000,9 @@ static int venc_open(struct file *file)
 	INIT_LIST_HEAD(&inst->registeredbufs);
 	INIT_LIST_HEAD(&inst->internalbufs);
 	INIT_LIST_HEAD(&inst->list);
+	INIT_LIST_HEAD(&inst->joan_held_caps);
+	INIT_DELAYED_WORK(&inst->joan_in_work, joan_in_work_fn);
+	INIT_WORK(&inst->joan_rec_work, joan_rec_work_fn);
 	mutex_init(&inst->lock);
 	mutex_init(&inst->ctx_q_lock);
 
